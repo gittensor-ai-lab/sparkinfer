@@ -636,7 +636,18 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         const char* e = getenv("SPARKINFER_PREFILL_ARENA_REUSE");
         return !(e && e[0] == '0');
     }();
-    constexpr size_t kArenaKeepBytes = 1ull << 30;
+    // 2 GB, not 1: an MoE model's mixed steps carry up to 4096 prompt tokens (pick_mixed_chunks),
+    // and Qwen3.6-35B-A3B's scratch for one is up to ~1.8 GB. At 1 GB, 130 of 461 passes in an
+    // AIPerf chat c32 run gave every arena back and the next pass cudaMalloc'd it all again --
+    // ~1,800 cudaFree calls, each a device-wide sync, inside the mixed steps' GPU idle. 2 GB keeps
+    // it: chat c16 / c32 1,464 / 1,648 -> 1,485 / 1,657 tok/s. SPARKINFER_PREFILL_ARENA_KEEP_MB
+    // moves the limit; SPARKINFER_PREFILL_ARENA_DEBUG=1 logs each pass's held/used scratch.
+    static const size_t kArenaKeepBytes = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_ARENA_KEEP_MB");
+        const long long v = e ? atoll(e) : 2048;
+        return (size_t)(v > 0 ? v : 2048) << 20;
+    }();
+    static const bool arena_dbg = getenv("SPARKINFER_PREFILL_ARENA_DEBUG") != nullptr;
     static thread_local Arena keep_a, keep_a8, keep_am, keep_aw;   // held across calls
     Arena once_a, once_a8, once_am, once_aw;                       // per-call otherwise
     if (arena_reuse) { keep_a.rewind(); keep_a8.rewind(); keep_am.rewind(); keep_aw.rewind(); }
@@ -4974,6 +4985,11 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     size_t recent_max = 0;
     for (size_t u : recent_used) recent_max = std::max(recent_max, u);
     const bool pf_oversized = shrink_on && pf_held > 2 * recent_max + (64ull << 20);
+    if (arena_dbg)
+        fprintf(stderr, "[prefill-arena] N=%d held %.0f MB used %.0f MB recent max %.0f MB%s\n", N,
+                pf_held / 1048576.0, pf_used / 1048576.0, recent_max / 1048576.0,
+                (!arena_reuse || (!g_pf_hold_arena && (pf_held > kArenaKeepBytes || pf_oversized)))
+                    ? " -> release" : "");
     if (!arena_reuse ||
         (!g_pf_hold_arena && (pf_held > kArenaKeepBytes || pf_oversized))) {
         if (shrink_on) kernels::prefill_scratch_release();
