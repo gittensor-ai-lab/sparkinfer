@@ -266,6 +266,9 @@ public:
     // Turn on the automatic prefix cache. Off by default: benchmarks and the eval harness measure
     // prefill from zero, and a cache hit would change what they measure. Call before submitting.
     void enable_prefix_cache(const PrefixCache::Limits& limits);
+    // Drop the prefix cache and everything it holds (its blocks go back to the pool). For a pool
+    // re-size at startup; enable_prefix_cache() builds a fresh one afterwards.
+    void disable_prefix_cache();
     // All zeros while the cache is off.
     PrefixCache::Stats prefix_cache_stats() const;
 

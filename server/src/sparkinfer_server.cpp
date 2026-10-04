@@ -1046,6 +1046,10 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Everything that loads at startup is resident now; give the KV pool what is left above the
+    // serving headroom.
+    engine.grow_kv_pool();
+
     const std::vector<int> prefix_ids = load_prefix_token_ids();
     if (!prefix_ids.empty()) {
         engine.set_prefix_tokens(prefix_ids);

@@ -236,11 +236,46 @@ KVCacheManager::KVCacheManager(const KVCacheConfig& cfg, size_t pool_bytes)
     for (int i = kMaxSeqs - 1; i >= 0; --i) impl_->free_slots.push_back(i);
 }
 
+namespace {
+template <class I>
+void free_pool_buffers(I& p) {
+    cudaFree(p.k_pool); cudaFree(p.v_pool); cudaFree(p.d_block_tables);
+    if (p.d_win_tables) cudaFree(p.d_win_tables);
+    if (p.k_scale) cudaFree(p.k_scale);
+    if (p.v_scale) cudaFree(p.v_scale);
+    p.k_pool = p.v_pool = p.k_scale = p.v_scale = nullptr;
+    p.d_block_tables = p.d_win_tables = nullptr;
+}
+}  // namespace
+
 KVCacheManager::~KVCacheManager() {
-    cudaFree(impl_->k_pool); cudaFree(impl_->v_pool); cudaFree(impl_->d_block_tables);
-    if (impl_->d_win_tables) cudaFree(impl_->d_win_tables);
-    if (impl_->k_scale) cudaFree(impl_->k_scale);
-    if (impl_->v_scale) cudaFree(impl_->v_scale);
+    if (impl_) free_pool_buffers(*impl_);
+}
+
+bool KVCacheManager::resize_idle(size_t pool_bytes) {
+    if (!impl_->seq_blocks.empty() || !impl_->seq_ring.empty()) return false;
+    for (int r : impl_->refs) if (r) return false;
+    const KVCacheConfig cfg = impl_->cfg;
+    // Free first: the point of re-sizing is usually to hand the pool memory it could not have
+    // had while the old buffers were still resident.
+    free_pool_buffers(*impl_);
+    KVCacheManager fresh(cfg, pool_bytes);
+    std::swap(impl_, fresh.impl_);   // fresh now holds the emptied old state; its dtor frees nothing
+    return impl_->k_pool && impl_->v_pool && impl_->d_block_tables &&
+           (!impl_->int8_kv || (impl_->k_scale && impl_->v_scale));
+}
+
+size_t KVCacheManager::resident_bytes() const {
+    const size_t elem = impl_->int8_kv ? 1 : 2;
+    const int alloc_slices = impl_->n_slots + (impl_->cfg.layer_slot.empty() ? 0 : 1);
+    const size_t pool_elems = impl_->win_on
+        ? (size_t)(impl_->n_full_slots + (alloc_slices - impl_->n_slots)) * impl_->layer_stride +
+              (size_t)impl_->n_win_slots * impl_->win_total_blocks * impl_->elems_per_block
+        : (size_t)alloc_slices * impl_->layer_stride;
+    size_t b = 2 * pool_elems * elem;
+    if (impl_->int8_kv) b += 2 * (pool_elems / impl_->cfg.head_dim) * sizeof(unsigned short);
+    b += (size_t)kMaxSeqs * impl_->max_blocks_per_seq * sizeof(int) * (impl_->win_on ? 2 : 1);
+    return b;
 }
 
 bool KVCacheManager::allocate(uint64_t seq_id, int num_tokens) {

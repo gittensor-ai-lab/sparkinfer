@@ -1138,6 +1138,12 @@ void ContinuousBatchEngine::enable_prefix_cache(const PrefixCache::Limits& limit
     if (!prefix_cache_) prefix_cache_ = std::make_unique<PrefixCache>(kv_, limits);
 }
 
+void ContinuousBatchEngine::disable_prefix_cache() {
+    std::lock_guard<std::recursive_mutex> device_lock(model_->device_mutex());
+    prefix_cache_.reset();
+    evictable_last_.store(0, std::memory_order_relaxed);
+}
+
 PrefixCache::Stats ContinuousBatchEngine::prefix_cache_stats() const {
     return prefix_cache_ ? prefix_cache_->stats() : PrefixCache::Stats{};
 }

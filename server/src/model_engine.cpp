@@ -160,6 +160,9 @@ struct ModelEngine::Impl {
 
     // Automatic prefix cache: see ModelEngine::set_prefix_cache_boundary_token.
     bool prefix_cache_on = false;
+    sparkinfer::PrefixCache::Limits prefix_limits;   // as enabled; max_blocks re-derived on growth
+    int prefix_kv_pct = 75;
+    size_t kv_budget_per_block = 0;                  // load()'s bf16-denominated pool_bytes / block
     int prefix_cache_boundary_token = -1;
     int prefix_cache_min_tokens = 1024;
 
@@ -312,8 +315,9 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
     // is correct as written -- it must stay even when int8_kv is on, or capacity halves. What has
     // to match kvc.layer_slot is the SLOT COUNT: passing n_layers while the manager counts 16
     // slots would hand out 4x the blocks for the same memory rather than shrinking the pool.
+    impl_->kv_budget_per_block = (size_t)kvL * 2 * epb * 2;
     impl_->kv = std::make_unique<sparkinfer::KVCacheManager>(
-        kvc, (size_t)kvL * 2 * epb * 2 * blocks);
+        kvc, impl_->kv_budget_per_block * blocks);
 
     // Reports the slot count actually used, and the resident bytes rather than the bf16 budget --
     // the old line multiplied by n_layers (all 64) and by 2 regardless of int8, so it overstated
@@ -438,6 +442,8 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
                 (int)std::max(1LL, env_int("SPARKINFER_PREFIX_CACHE_MIN_TOKENS", 1024));
             impl_->batch_engine->enable_prefix_cache(lim);
             impl_->prefix_cache_on = true;
+            impl_->prefix_limits = lim;
+            impl_->prefix_kv_pct = (int)kv_pct;
             fprintf(stderr, "[sparkinfer-server] prefix cache: on (%zu entries, %zu MiB host, %d of %d "
                             "KV blocks, %zu MiB host KV tier, checkpoints from %d tokens)\n",
                     lim.max_entries, lim.max_host_bytes >> 20, lim.max_blocks,
@@ -865,6 +871,54 @@ int ModelEngine::free_kv_blocks() const {
 int ModelEngine::max_queue_depth() const {
     std::lock_guard<std::mutex> lock(mu_);
     return (impl_->ready && impl_->batch_engine) ? impl_->batch_engine->max_queue_depth() : 0;
+}
+
+void ModelEngine::grow_kv_pool() {
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!impl_->ready || !impl_->kv || !impl_->batch_engine || !impl_->kv_budget_per_block) return;
+    const char* on = getenv("SPARKINFER_KV_GROW");
+    if (on && on[0] == '0') return;
+    // The LMCache sidecar was handed the pool's layout at load; leave a pool it knows alone.
+    if (impl_->lmcache_bridge) return;
+    const char* he = getenv("SPARKINFER_KV_HEADROOM_GIB");
+    const double head_gib = he ? atof(he) : 6.0;
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) return;
+    const size_t head_b = (size_t)(head_gib * (double)(1ull << 30));
+    const int cur_blocks = impl_->kv->num_total_blocks();
+    const size_t cur_res = impl_->kv->resident_bytes();
+    if (free_b <= head_b || cur_blocks <= 0 || !cur_res) return;
+    // Resident bytes per block, block tables included (they scale with the pool too).
+    const double per_block = (double)cur_res / (double)cur_blocks;
+    const long long add = (long long)((double)(free_b - head_b) / per_block);
+    // Not worth re-sizing for crumbs; and stay well inside the int block ids.
+    if (add < cur_blocks / 8) return;
+    const long long want = std::min<long long>((long long)cur_blocks + add, 1LL << 22);
+    // The prefix cache holds the pool's layout and a share of its blocks: rebuild it around the
+    // new pool. Nothing has been cached yet -- this runs before the first request.
+    if (impl_->prefix_cache_on) impl_->batch_engine->disable_prefix_cache();
+    bool ok = impl_->kv->resize_idle(impl_->kv_budget_per_block * (size_t)want);
+    if (!ok) {
+        fprintf(stderr, "[sparkinfer-server] kv_cache: growing to %lld blocks failed; keeping %d\n",
+                want, cur_blocks);
+        if (!impl_->kv->resize_idle(impl_->kv_budget_per_block * (size_t)cur_blocks))
+            fprintf(stderr, "[sparkinfer-server] kv_cache: could not restore the pool\n");
+    }
+    if (impl_->prefix_cache_on) {
+        sparkinfer::PrefixCache::Limits lim = impl_->prefix_limits;
+        lim.max_blocks = (int)((long long)impl_->kv->num_total_blocks() * impl_->prefix_kv_pct / 100);
+        impl_->batch_engine->enable_prefix_cache(lim);
+        impl_->prefix_limits = lim;
+    }
+    size_t free_after = 0;
+    cudaMemGetInfo(&free_after, &total_b);
+    const int bs = impl_->kv->block_size();
+    fprintf(stderr, "[sparkinfer-server] kv_cache grown: %d -> %d blocks (%lld -> %lld tokens), "
+                    "resident %.1f GiB, %.1f GiB left free (SPARKINFER_KV_HEADROOM_GIB=%.1f)\n",
+            cur_blocks, impl_->kv->num_total_blocks(), (long long)cur_blocks * bs,
+            (long long)impl_->kv->num_total_blocks() * bs,
+            (double)impl_->kv->resident_bytes() / (double)(1ull << 30),
+            (double)free_after / (double)(1ull << 30), head_gib);
 }
 
 bool ModelEngine::load_draft(const std::string& dir, std::string& err) {

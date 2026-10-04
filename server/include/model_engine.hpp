@@ -259,6 +259,13 @@ public:
     // SPARKINFER_DSPARK_MAX_CTX (default 16384) -- its KV and projection buffers scale with it, and a
     // request that needs more simply decodes ordinarily. Call after load().
     bool load_draft(const std::string& dir, std::string& err);
+    // Grow the KV pool into the device memory left free once everything that loads at startup
+    // (target, draft, vision tower) is resident, keeping SPARKINFER_KV_HEADROOM_GIB (default 6)
+    // free for the packed-decode graphs and batched-prefill scratch that the first requests
+    // allocate. load() sizes the pool to one --ctx, which at 8K prompts admits only a handful of
+    // concurrent requests while gigabytes sit unused. Call after load() / load_draft(), before
+    // serving. SPARKINFER_KV_GROW=0 keeps the --ctx-sized pool.
+    void grow_kv_pool();
     bool speculative() const;
     struct SpeculativeStats {
         bool enabled = false;

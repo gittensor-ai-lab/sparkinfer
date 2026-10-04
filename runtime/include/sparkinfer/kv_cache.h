@@ -104,6 +104,17 @@ public:
     explicit KVCacheManager(const KVCacheConfig& cfg, size_t pool_bytes);
     ~KVCacheManager();
 
+    // Re-size the pool to pool_bytes (same bf16-denominated budget the constructor takes) while
+    // nothing holds a block: no sequence, no ring, no retained prefix. The old device buffers are
+    // freed BEFORE the new ones are allocated, so the new pool may use their memory. Every pointer
+    // previously returned (k_pool, v_pool, block tables) is invalidated, so call it only before
+    // anything has captured them -- in practice, at startup before the first request. False if
+    // the pool is not idle, or if the new allocation failed (the manager is then left empty;
+    // call again with the old size).
+    bool resize_idle(size_t pool_bytes);
+    // Device bytes the pool actually holds (int8 or bf16 elements, scales and tables included).
+    size_t resident_bytes() const;
+
     // Allocate physical blocks for a sequence (grows if already allocated).
     // Returns false if OOM. Idempotent when num_tokens fits existing allocation.
     bool allocate(uint64_t seq_id, int num_tokens);
