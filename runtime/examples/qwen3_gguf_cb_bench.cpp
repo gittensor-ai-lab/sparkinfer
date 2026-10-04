@@ -28,6 +28,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <fstream>
 #include <random>
 #include <thread>
 #include <vector>
@@ -231,7 +232,24 @@ int main(int argc, char** argv) {
         return e && atoi(e) != 0;
     }();
     std::vector<std::vector<int>> prompts((size_t)concurrency, short_prompt);
-    if (distinct) {
+    // SPARKINFER_CB_BENCH_CORPUS=<file of whitespace-separated token ids>: every stream takes its
+    // own consecutive slice of real text. Random ids (DISTINCT) route an MoE step's rows to nearly
+    // every expert -- the worst case for the expert weight traffic -- while real text concentrates
+    // them (~100 of Qwen3.6's 256 experts a layer at 32 rows), which is what a server sees.
+    static const char* corpus = getenv("SPARKINFER_CB_BENCH_CORPUS");
+    if (corpus) {
+        std::ifstream f(corpus);
+        std::vector<int> ids;
+        for (int t; f >> t;) ids.push_back(t);
+        const size_t need = (size_t)concurrency * prompt_len;
+        if (ids.size() >= need)
+            for (int i = 0; i < concurrency; i++)
+                prompts[(size_t)i].assign(ids.begin() + (size_t)i * prompt_len,
+                                          ids.begin() + (size_t)(i + 1) * prompt_len);
+        else
+            fprintf(stderr, "[cb_bench] corpus %s has %zu ids, need %zu -- shared prompt\n",
+                    corpus, ids.size(), need);
+    } else if (distinct) {
         const int vocab = model.config().vocab > 0 ? model.config().vocab : 32000;
         const int hi = std::min(vocab, 150000) - 1;
         for (int i = 0; i < concurrency; i++) {
@@ -270,7 +288,7 @@ int main(int argc, char** argv) {
         long_ttft_s > 0 ? (double)long_prefill / long_ttft_s : 0.0;
     printf("cb_bench policy=%s concurrency=%d prompt=%d max_new=%d long_prefill=%d%s\n",
            policy_name(policy), concurrency, prompt_len, max_new, long_prefill,
-           distinct ? " distinct" : "");
+           corpus ? " corpus" : distinct ? " distinct" : "");
     printf("wall_s=%.3f decode_tokens=%d agg_tok_s=%.1f mean_itl_ms=%.2f max_itl_ms=%.2f\n",
            wall_s, toks, wall_s > 0 ? toks / wall_s : 0.0, itl_ms, max_itl_ms);
     printf("long_ttft_s=%.3f long_prefill_pp=%.1f tokens_while_long_active=%d\n", long_ttft_s,
