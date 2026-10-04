@@ -26,7 +26,7 @@ void launch_prefill_quantize_rows_fp8(const void* x_bf16, void* q, float* scale,
 // The same per-row e4m3 quantize, of a GGUF weight read in place: the values are the bf16 that
 // launch_gguf_dequant would have written (same expression, same rounding), so the bytes and scales
 // match dequantize-then-launch_prefill_quantize_rows_fp8 exactly, without the bf16 round trip
-// through memory. Q8_0 only; returns false (nothing launched) for any other type or shape.
+// through memory. Q8_0 and Q4_K; returns false (nothing launched) for any other type or shape.
 bool launch_prefill_quantize_rows_fp8_gguf(int ggml_type, const void* w, void* q, float* scale,
                                            int rows, int cols, cudaStream_t stream = nullptr);
 

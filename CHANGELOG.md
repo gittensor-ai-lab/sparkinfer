@@ -5,6 +5,18 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+### Performance
+
+- **Qwen3.6 short-prompt prefill +5% / +2% more (128 / 512 tokens): Q4_K weights also quantize to
+  fp8 in place.** The fp8 projection path still dequantized its Q4_K weights (Qwen3.6's attention
+  q / o, refit to Q4_K at load: 110 tensors a prefill) to bf16 first.
+  `launch_prefill_quantize_rows_fp8_gguf` now reads Q4_K too, computing each value with the
+  coalesced dequant's expression (`deq_q4k_lane8`) in a TU built with the same flags; with
+  `SPARKINFER_DETERMINISTIC=1` the prefill check's KL is identical to the bit on Qwen3.6 and
+  Qwen3.8.
+  - **Measured** (Qwen3.6-35B-A3B UD-Q4_K_M, RTX 5090): prefill 6,635 / 16,540 / 23,370 ->
+    6,963 / 16,903 / 23,578 tok/s at 128 / 512 / 1K tokens.
+
 ## [0.6.15] — 2026-10-04
 
 **Qwen3.6 prefill +7% at 512 tokens and +12% at 1K: MoE tiles sized to the experts' load.**

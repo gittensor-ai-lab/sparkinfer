@@ -617,6 +617,79 @@ __global__ __launch_bounds__(BLOCK) void pf_quantize_rows_fp8_q80_kernel(
     }
 }
 
+// The same for a Q4_K weight: thread slot p owns values [8p, 8p+8), which is lane (p & 31) of
+// super-block p >> 5 -- exactly the eight values deq_q4k_lane8 (dequant_gguf_fast.cu, the
+// coalesced dequant the bf16 path runs) gives a lane, computed with its expression in a TU built
+// with the same flags, so the bf16 values match; the reduction and e4m3 conversion are the fast
+// kernel's.
+template <int BLOCK, int SLOTS>
+__global__ __launch_bounds__(BLOCK) void pf_quantize_rows_fp8_q4k_kernel(
+        const unsigned char* __restrict__ w, __nv_fp8_e4m3* __restrict__ q,
+        float* __restrict__ scale, int rows, int cols) {
+    constexpr int VEC = 8;
+    const int r   = blockIdx.x;
+    const int tid = threadIdx.x;
+    if (r >= rows) return;
+    const unsigned char* row = w + (size_t)r * (size_t)(cols / 256) * 144;
+    const size_t base = (size_t)r * cols;
+
+    __nv_bfloat16 reg[SLOTS][VEC];
+    float amax = 0.f;
+    #pragma unroll
+    for (int s = 0; s < SLOTS; s++) {
+        const int p = tid + s * BLOCK;
+        if (p * VEC < cols) {
+            const unsigned char* blk = row + (size_t)(p >> 5) * 144;
+            const int lane = p & 31;
+            const float d    = __half2float(__ushort_as_half(*reinterpret_cast<const unsigned short*>(blk)));
+            const float dmin = __half2float(__ushort_as_half(*reinterpret_cast<const unsigned short*>(blk + 2)));
+            const unsigned char* sc = blk + 4;
+            const int n0 = lane * 8, jj = n0 >> 6, half = (n0 & 63) >> 5, l0 = n0 & 31;
+            const int j = jj * 2 + half;
+            int sv, mv;
+            if (j < 4) { sv = sc[j] & 63; mv = sc[j + 4] & 63; }
+            else {
+                sv = (sc[j + 4] & 0xF) | ((sc[j - 4] >> 6) << 4);
+                mv = (sc[j + 4] >> 4)  | ((sc[j]     >> 6) << 4);
+            }
+            const float dd = d * sv, mm = dmin * mv;
+            const unsigned char* qp = blk + 16 + jj * 32 + l0;
+            #pragma unroll
+            for (int t = 0; t < 8; t++) {
+                const unsigned char qb = qp[t];
+                const int nib = half ? (qb >> 4) : (qb & 0xF);
+                reg[s][t] = __float2bfloat16(dd * nib - mm);
+            }
+            #pragma unroll
+            for (int v = 0; v < VEC; v++) amax = fmaxf(amax, fabsf(__bfloat162float(reg[s][v])));
+        }
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    __shared__ float sred[BLOCK / 32];
+    if ((tid & 31) == 0) sred[tid >> 5] = amax;
+    __syncthreads();
+    if (tid < 32) {
+        float v = (tid < BLOCK / 32) ? sred[tid] : 0.f;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+        if (tid == 0) sred[0] = v;
+    }
+    __syncthreads();
+    const float d = (sred[0] == 0.f) ? 1.f : (sred[0] / FP8_TGT);
+    if (tid == 0) scale[r] = d;
+    #pragma unroll
+    for (int s = 0; s < SLOTS; s++) {
+        const int c = (tid + s * BLOCK) * VEC;
+        if (c < cols) {
+            __nv_fp8_e4m3 out[VEC];
+            #pragma unroll
+            for (int v = 0; v < VEC; v++) out[v] = __nv_fp8_e4m3(__bfloat162float(reg[s][v]) / d);
+            *reinterpret_cast<uint2*>(&q[base + c]) = *reinterpret_cast<const uint2*>(out);
+        }
+    }
+}
+
 bool launch_prefill_quantize_rows_fp8_gguf(int ggml_type, const void* w, void* q, float* scale,
                                            int rows, int cols, cudaStream_t stream) {
     // SPARKINFER_FP8_QUANT_GGUF=0 sends every weight back through dequantize + quantize (A/B).
@@ -624,11 +697,29 @@ bool launch_prefill_quantize_rows_fp8_gguf(int ggml_type, const void* w, void* q
         const char* e = getenv("SPARKINFER_FP8_QUANT_GGUF");
         return !(e && e[0] == '0');
     }();
-    if (!on || ggml_type != 8 || rows <= 0 || cols <= 0 || (cols % 32) != 0) return false;
+    if (!on || rows <= 0 || cols <= 0) return false;
     constexpr int BLOCK = 256;
     const int vecs = cols / 8;
     const auto* wb = reinterpret_cast<const unsigned char*>(w);
     auto* qb = reinterpret_cast<__nv_fp8_e4m3*>(q);
+    // Q4_K: whole super-blocks only. The bf16 path's coalesced dequant (deq_q4k_lane8) is the one
+    // this matches; SPARKINFER_DEQUANT_COALESCED=0 switches that path to the scalar kernel, whose
+    // FMA contraction may differ, so step aside then.
+    static const bool coalesced = [] {
+        const char* e = getenv("SPARKINFER_DEQUANT_COALESCED");
+        return !(e && e[0] == '0');
+    }();
+    if (ggml_type == 12) {
+        if (!coalesced || (cols % 256) != 0) return false;
+        if (vecs <= BLOCK * 1)      pf_quantize_rows_fp8_q4k_kernel<BLOCK, 1><<<rows, BLOCK, 0, stream>>>(wb, qb, scale, rows, cols);
+        else if (vecs <= BLOCK * 2) pf_quantize_rows_fp8_q4k_kernel<BLOCK, 2><<<rows, BLOCK, 0, stream>>>(wb, qb, scale, rows, cols);
+        else if (vecs <= BLOCK * 3) pf_quantize_rows_fp8_q4k_kernel<BLOCK, 3><<<rows, BLOCK, 0, stream>>>(wb, qb, scale, rows, cols);
+        else if (vecs <= BLOCK * 4) pf_quantize_rows_fp8_q4k_kernel<BLOCK, 4><<<rows, BLOCK, 0, stream>>>(wb, qb, scale, rows, cols);
+        else if (vecs <= BLOCK * 8) pf_quantize_rows_fp8_q4k_kernel<BLOCK, 8><<<rows, BLOCK, 0, stream>>>(wb, qb, scale, rows, cols);
+        else return false;
+        return true;
+    }
+    if (ggml_type != 8 || (cols % 32) != 0) return false;
     if (vecs <= BLOCK * 1)       pf_quantize_rows_fp8_q80_kernel<BLOCK, 1><<<rows, BLOCK, 0, stream>>>(wb, qb, scale, rows, cols);
     else if (vecs <= BLOCK * 2)  pf_quantize_rows_fp8_q80_kernel<BLOCK, 2><<<rows, BLOCK, 0, stream>>>(wb, qb, scale, rows, cols);
     else if (vecs <= BLOCK * 3)  pf_quantize_rows_fp8_q80_kernel<BLOCK, 3><<<rows, BLOCK, 0, stream>>>(wb, qb, scale, rows, cols);
