@@ -5,6 +5,12 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+## [0.6.15] — 2026-10-04
+
+**Qwen3.6 prefill +7% at 512 tokens and +12% at 1K: MoE tiles sized to the experts' load.**
+- **Now:** 16,540 / 23,370 / 27,342 tok/s at 512 / 1K / 2K tokens (0.6.14: 15,396 / 20,953 /
+  ~26,300; llama.cpp on the same GGUF: 9,438 at 512). Bit-identical output.
+
 ### Performance
 
 - **Qwen3.6 prefill +7% at 512 tokens and +12% at 1K: MoE tiles sized to the experts' load.** The
