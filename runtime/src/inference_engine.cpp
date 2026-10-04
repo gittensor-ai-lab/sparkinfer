@@ -1164,6 +1164,20 @@ uint64_t ContinuousBatchEngine::submit_locked(Job job, const std::function<bool(
     if (job.req.prompt.empty() || job.req.max_new_tokens <= 0) return fail(err);
     if ((int)job.req.prompt.size() + job.req.max_new_tokens > model_->config().max_seq)
         return fail(EnqueueError::BAD_REQUEST);
+    // Every id the forward will embed has to be a row of the embedding table. One that is not
+    // reads past it on the device -- an illegal address that loses the CUDA context and takes
+    // the whole server down for every client, where it should be one 400. Reachable from a
+    // server run with a tokenizer from another model (Qwen3.8's 248K ids against Muse Glimmer's
+    // 202K rows crashed on the first request) and from any embedding caller passing raw ids.
+    {
+        const int vocab = model_->config().vocab;
+        auto bad = [vocab](const std::vector<int>& ids) {
+            for (int t : ids) if (t < 0 || t >= vocab) return true;
+            return false;
+        };
+        if (vocab > 0 && (bad(job.req.prompt) || bad(job.req.forced_tokens)))
+            return fail(EnqueueError::BAD_REQUEST);
+    }
 
     const int cap = max_queue_depth_config();
     if (cap > 0) {
