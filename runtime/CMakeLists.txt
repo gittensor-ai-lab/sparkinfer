@@ -110,6 +110,10 @@ if(BUILD_EXAMPLES)
     add_executable(nvfp4_gemm_check examples/nvfp4_gemm_check.cpp)
     target_include_directories(nvfp4_gemm_check PRIVATE include)
     target_link_libraries(nvfp4_gemm_check PRIVATE sparkinfer_runtime CUDA::cudart)
+    # Model-free timing of the packed-decode Q4_K row projections, weights DRAM-cold.
+    add_executable(q4k_rows_bench examples/q4k_rows_bench.cpp)
+    target_include_directories(q4k_rows_bench PRIVATE include)
+    target_link_libraries(q4k_rows_bench PRIVATE sparkinfer_runtime CUDA::cudart)
 
     add_executable(qwen3_gguf_prefill_check examples/qwen3_gguf_prefill_check.cpp)
     target_include_directories(qwen3_gguf_prefill_check PRIVATE include)
