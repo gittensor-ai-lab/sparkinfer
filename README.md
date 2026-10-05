@@ -228,9 +228,9 @@ Time to first token in ms (p50 / p90 / p99):
 - **Still behind:** time to first token in the 8K-prompt cells at 16+ requests, 1.6 / 14.2 s p50
   against vLLM's 1.2 / 12.4.
 - **Smaller `--ctx`:** the KV pool grows into the memory left free after startup (0.6.18), so it
-  no longer caps concurrency at one `--ctx` of tokens. At `--ctx 32768` without a drafter, 0.6.18
-  against vLLM 0.30.0: chat 321 / 900 / 1,260 vs 271 / 862 / 1,239 tok/s at 4 / 16 / 32 requests,
-  8K prompts 204 / 303 vs 187 / 306 at 4 / 16.
+  no longer caps concurrency at one `--ctx` of tokens. At `--ctx 32768` without a drafter, 0.6.25
+  against vLLM 0.30.0: chat 314 / 908 / 1,259 vs 271 / 862 / 1,239 tok/s at 4 / 16 / 32 requests,
+  8K prompts 188 / 310 vs 187 / 306 at 4 / 16.
 
 ### Same weights, GGUF on both sides
 
@@ -275,18 +275,18 @@ Full tables: [`bench/competitors/latest-results.md`](bench/competitors/latest-re
 [`bench/quality/README.md`](bench/quality/README.md).
 
 Serving concurrent requests (AIPerf, streaming chat 1024 / 256 with `ignore_eos`, a distinct
-prompt set per cell, RTX 5090). sparkinfer 0.6.24 serves the UD-Q4_K_M GGUF, `llama-server`
+prompt set per cell, RTX 5090). sparkinfer 0.6.25 serves the UD-Q4_K_M GGUF, `llama-server`
 (llama.cpp `436f6f8`, `-np 32 -fa on`, measured on 0.6.17's run) the same file, and vLLM 0.30.0
 its best format on this card, `nvidia/Qwen3.6-35B-A3B-NVFP4`:
 
 | requests | output tok/s | TTFT p50 (ms) | ITL p50 (ms) |
 |---:|---:|---:|---:|
 | | **sparkinfer** / llama.cpp / vLLM | **sparkinfer** / llama.cpp / vLLM | **sparkinfer** / llama.cpp / vLLM |
-| 4 | **911** / 339 / 666 | **151** / 1,329 / 176 | **3.8** / 7.2 / 5.3 |
-| 16 | **1,688** / 372 / 1,686 | **288** / 2,493 / 398 | 8.4 / 33.2 / **7.9** |
-| 32 | 2,224 / 404 / **2,367** | **377** / 2,436 / 521 | 13.2 / 69.0 / **11.6** |
+| 4 | **910** / 339 / 666 | 181 / 1,329 / **176** | **3.8** / 7.2 / 5.3 |
+| 16 | **1,693** / 372 / 1,686 | **284** / 2,493 / 398 | 8.4 / 33.2 / **7.9** |
+| 32 | 2,215 / 404 / **2,367** | **350** / 2,436 / 521 | 13.4 / 69.0 / **11.6** |
 
-8K-token prompts, 4 / 16 requests: sparkinfer **520** / 646 tok/s, vLLM 450 / **652**. vLLM
+8K-token prompts, 4 / 16 requests: sparkinfer **520** / 645 tok/s, vLLM 450 / **652**. vLLM
 still leads Qwen3.6 at 32 concurrent requests (by 6%) and by 1% on 8K prompts at 16: the routed
 experts and the prompt work mixed into decode steps are where the remaining gap is being worked on.
 

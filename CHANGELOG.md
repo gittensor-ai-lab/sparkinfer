@@ -5,6 +5,15 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+## [0.6.25] — 2026-10-05
+
+**Gated-DeltaNet prompt processing: the chunked scan ~19% and its prep kernel ~13% faster, output
+bit-identical. Qwen3.8 serving now leads vLLM in every cell.**
+- **Now** (AIPerf streaming chat 1024 / 256, `ignore_eos`, distinct prompts, RTX 5090):
+  Qwen3.6-35B-A3B UD-Q4_K_M 910 / 1,693 / 2,215 output tok/s at 4 / 16 / 32 requests, 8K-token
+  prompts 520 / 645 at 4 / 16 (vLLM 0.30.0 on nvidia NVFP4: 666 / 1,686 / 2,367; 450 / 652);
+  Qwen3.8-27B NVFP4 314 / 908 / 1,259, 8K 188 / 310 (vLLM 271 / 862 / 1,239; 187 / 306).
+
 ### Performance
 
 - **The chunked Gated-DeltaNet prefill scan fetches each chunk's gates, U0 and M a chunk ahead.**
