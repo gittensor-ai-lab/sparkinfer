@@ -5,6 +5,17 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+## [0.6.24] — 2026-10-05
+
+**Qwen3.6 prompt processing ~10% faster: the routed MoE prefill GEMM is pipelined and on the
+m16n8k32 tensor-core path. Serving now matches vLLM at 16 concurrent requests and is within 1% on
+8K prompts.**
+- **Now** (AIPerf streaming chat 1024 / 256, `ignore_eos`, distinct prompts, Qwen3.6-35B-A3B
+  UD-Q4_K_M, RTX 5090): 911 / 1,688 / 2,224 output tok/s at 4 / 16 / 32 requests (0.6.23: 903 /
+  1,666 / 2,193; vLLM 0.30.0 on nvidia NVFP4: 666 / 1,686 / 2,367); 8K-token prompts 520 / 646 at
+  4 / 16 (vLLM 450 / 652), TTFT p50 916 ms at 16. Single-prompt prefill 4K / 8K 36.3K / 37.0K
+  tok/s.
+
 ### Performance
 
 - **The routed MoE GEMM a prefill (and a served mixed step) runs at 3K+ tokens is pipelined and on
