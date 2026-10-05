@@ -5,6 +5,15 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+## [0.6.23] — 2026-10-05
+
+**Qwen3.6 serving at 32 concurrent requests +17% (1,868 -> 2,193 output tok/s), now within 7% of vLLM
+on its NVFP4 checkpoint and level at 16.**
+- **Now** (AIPerf streaming chat 1024 / 256, `ignore_eos`, distinct prompts, Qwen3.6-35B-A3B
+  UD-Q4_K_M, RTX 5090): 903 / 1,666 / 2,193 output tok/s at 4 / 16 / 32 requests (0.6.22: 908 /
+  1,559 / 1,868; vLLM 0.30.0 on nvidia NVFP4: 666 / 1,686 / 2,367); 8K-token prompts 503 / 619 at
+  4 / 16 (vLLM 450 / 652). Qwen3.8 unchanged.
+
 ### Performance
 
 - **A served packed decode step no longer pins the MoE down projection to its exact-reproduction
@@ -16,9 +25,6 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
   chains and grouped verify keep the pin. Qwen3.6 served chat (AIPerf, distinct prompts) c16 / c32
   1,586 / 1,939 -> 1,666 / 2,193 output tok/s, 8K c16 598 -> 619; c4 and Qwen3.8 unchanged.
   `SPARKINFER_PACKED_MOE_EXACT=1` restores the pin.
-
-### Performance
-
 - **A packed batch's row GEMVs run their 8-row chunks as one launch** (bf16 row GEMV and the Q8_0
   row MMVQ). Each chunk alone launches N / RPB CTAs -- 128 for Qwen3.6's 256-expert router, 512 for
   its attention k / v -- and at 32 rows four of them ran back to back on the critical path. The
