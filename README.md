@@ -239,6 +239,21 @@ Time to first token in ms (p50 / p90 / p99):
   4 / 16 / 32 requests, 8K prompts **193** / **312** vs 189 / 308 at 4 / 16; TTFT p50 at 32 chat
   requests 387 vs 1,217 ms.
 
+### Long prompts against vLLM
+
+One request at a time, 128-token answers (`ignore_eos`), prefix caching off on both engines, RTX
+5090, sparkinfer 0.6.30 `--ctx 131072` against vLLM 0.30.0 `--max-model-len 131072`. Time to first
+token, and inter-token latency p50:
+
+| prompt | Qwen3.8-27B NVFP4: TTFT | ITL | Qwen3.6-35B-A3B: TTFT | ITL |
+|---:|---:|---:|---:|---:|
+| 32K | **2.49** / 3.33 s | **10.7** / 12.1 ms | **1.31** / 1.39 s | **2.13** / 4.30 ms |
+| 64K | **6.05** / 9.25 s | **11.3** / 12.7 ms | **3.33** / 3.67 s | **2.13** / 4.63 ms |
+| 120K | **14.4** / 25.1 s | **12.4** / 13.7 ms | **8.28** / 9.46 s | **2.14** / 5.27 ms |
+
+(sparkinfer / vLLM; Qwen3.6 is the UD-Q4_K_M GGUF on sparkinfer and nvidia's NVFP4 checkpoint on
+vLLM.)
+
 ### Same weights, GGUF on both sides
 
 To make the engine comparison fair, the same GGUF goes through both engines:
