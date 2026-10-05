@@ -5,6 +5,15 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+## [0.6.22] — 2026-10-05
+
+**Qwen3.6 serving at 32 concurrent requests +5%: the routed MoE reads each expert's weights about
+once per decode step instead of once per token routed to it.**
+- **Now** (AIPerf streaming chat 1024 / 256, `ignore_eos`, distinct prompts, Qwen3.6-35B-A3B
+  UD-Q4_K_M, RTX 5090): 908 / 1,559 / 1,868 output tok/s at 4 / 16 / 32 requests (0.6.21: 903 /
+  1,564 / 1,773; vLLM 0.30.0 on nvidia NVFP4: 666 / 1,686 / 2,367); 8K-token prompts 502 / 602 at
+  4 / 16 (vLLM 450 / 652).
+
 ### Performance
 
 - **Qwen3.6's routed MoE reads each expert's weights about once per batched decode step, not once
