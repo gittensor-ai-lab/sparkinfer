@@ -13,8 +13,11 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
   barrier. They now come into registers at the end of the previous chunk, beside the W / K / Q
   cp.async that was already issued there (shared memory has no room for a second plane at two
   blocks an SM). Same values into the same slots: bit-identical (Qwen3.6 teacher-forced scoring
-  over 1,499 positions matches exactly). Scan per layer at 8K tokens 1,057 -> 882 us; Qwen3.6
-  prefill 8K 37.1K -> 38.0K tok/s, 2K 29.0K -> 29.4K.
+  over 1,499 positions matches exactly). Scan per layer at 8K tokens 1,057 -> 882 us.
+- **The GDN prep kernel stages K / Q sixteen bytes a load, and starts V streaming as soon as Q is
+  done with** (behind the triangular solve and W^, instead of after them). Same values:
+  bit-identical. Prep per layer at 8K tokens 390 -> 341 us.
+- Together: Qwen3.6 prefill 8K 37.1K -> 38.3K tok/s, 2K 29.0K -> 29.6K.
 
 ## [0.6.24] — 2026-10-05
 
