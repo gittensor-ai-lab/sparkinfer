@@ -419,9 +419,10 @@ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
     float* s_U = REGS ? s_S : s_S + (size_t)HD * JC;                           // [C][JC]
     float* s_M = s_U + (size_t)C * JC;                                         // [C][C+PAD]
     float* s_g = s_M + (size_t)C * (C + PAD);                                  // [C]
-    float* s_eg = s_g + C;                                                     // [C] hoisted per-row expf
+    float* s_eg = s_g + C;                                                     // [C] exp(G_i)
+    float* s_eg2 = s_eg + C;                                                   // [C] exp(G_last - G_i)
     __nv_bfloat16* s_W =
-        reinterpret_cast<__nv_bfloat16*>(s_eg + C);                            // [C][HD+PAD]
+        reinterpret_cast<__nv_bfloat16*>(s_eg2 + C);                           // [C][HD+PAD]
     __nv_bfloat16* s_Q = s_W + (size_t)C * (HD + PAD);                         // [C][HD+PAD]
     __nv_bfloat16* s_K = s_Q + (size_t)C * (HD + PAD);                         // [C][HD+PAD]
     // bf16 operand mirrors. S stays fp32 across chunks (it is the recurrent carrier); it is
@@ -528,7 +529,17 @@ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
         const int len = min(C, n_tokens - t0);
 
         // ---- stage the small linear tiles (prefetched in registers); W/K/Q via cp.async ----
-        if (tid < C) s_g[tid] = pf_g;
+        // Both per-row decays the chunk uses are formed here, by the one warp that holds the gates
+        // (C is the warp size): exp(G_i) for Y and exp(G_last - G_i) for U~, the same expf of the
+        // same values their own passes computed further down, each of which then cost a pass and
+        // a block barrier. g_last is row len-1 (not C-1: a short final chunk's tail gates are 0).
+        static_assert(C == 32, "the gate warp is one full warp");
+        if (tid < C) {
+            s_g[tid] = pf_g;
+            s_eg[tid] = __expf(pf_g);
+            const float gl_row = __shfl_sync(0xffffffffu, pf_g, len - 1);
+            s_eg2[tid] = __expf(gl_row - pf_g);
+        }
         // Every per-element loop in this chunk body moves FOUR values at a time. At C=JC=32 each
         // of them is exactly C*JC == 1024 elements over 256 threads, so scalar they are 4 trips of
         // 2-3 memory instructions each; the body is bound by how many load/store instructions it
@@ -638,8 +649,6 @@ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
         // s_U[p][jj] is read once per p, s_M[i][p] and the hoisted exp(G_i) are warp-
         // uniform broadcasts, and each output still sums its p-terms in ascending order --
         // bit-identical to the reference element loop.
-        for (int i = tid; i < C; i += nthr) s_eg[i] = __expf(s_g[i]);
-        __syncthreads();
         {
             constexpr int NTHR2 = NW * 32;
             constexpr int OPT = (C * JC) / NTHR2;
@@ -694,22 +703,16 @@ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
         // element (same inputs/op/downstream multiply -> bit-identical). g_last reads len-1 (NOT
         // C-1): on a short final chunk the staged s_g tail is 0, not G_last, so C-1 would set decay
         // exp(G_last)=1 and overflow U~ = exp(-G_p)U^ (main fix #604/#608).
+        // The scale and the bf16 narrowing for the S update are one pass now (the scaled fp32 U~
+        // had no other reader): same products, rounded to bf16 as before.
         const float g_last = s_g[len - 1];
-        for (int i = tid; i < C; i += nthr) s_eg[i] = __expf(g_last - s_g[i]);
-        __syncthreads();
-        for (int q4 = tid; q4 < J4; q4 += nthr) {
-            const int e = q4 * 4, i = e / JC;
-            const float g = s_eg[i];                  // one row per group of 4: i is constant
-            float4 u = *reinterpret_cast<const float4*>(&s_U[e]);
-            u.x *= g; u.y *= g; u.z *= g; u.w *= g;
-            *reinterpret_cast<float4*>(&s_U[e]) = u;
-        }
-        __syncthreads();
 
         // ---- S = exp(G_last) S + K^T U~   [HD,C] x [C,JC], on tensor cores ----
         for (int q4 = tid; q4 < J4; q4 += nthr) {
             const int e = q4 * 4, i = e / JC, jj = e - i * JC;
-            const float4 u = *reinterpret_cast<const float4*>(&s_U[e]);
+            const float g = s_eg2[i];                 // one row per group of 4: i is constant
+            float4 u = *reinterpret_cast<const float4*>(&s_U[e]);
+            u.x *= g; u.y *= g; u.z *= g; u.w *= g;
             const __nv_bfloat16 b4[4] = {__float2bfloat16(u.x), __float2bfloat16(u.y),
                                          __float2bfloat16(u.z), __float2bfloat16(u.w)};
             *reinterpret_cast<ushort4*>(&s_Ub[i * (JC + PAD) + jj]) =
@@ -849,7 +852,7 @@ constexpr size_t gdnc_scan_smem() {
     return (REGS ? 0 : (size_t)HD * JC * sizeof(float))                     // s_S (fp32 carrier)
          + (size_t)C * JC * sizeof(float)                                   // s_U
          + (size_t)C * (C + PAD) * sizeof(float)                            // s_M
-         + (size_t)2 * C * sizeof(float)                                    // s_g, s_eg
+         + (size_t)3 * C * sizeof(float)                                    // s_g, s_eg, s_eg2
          + (size_t)3 * C * (HD + PAD) * sizeof(__nv_bfloat16)               // s_W, s_Q, s_K
          + (size_t)HD * (JC + PAD) * sizeof(__nv_bfloat16);                 // s_Sb
 }

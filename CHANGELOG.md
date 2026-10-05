@@ -17,7 +17,10 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 - **The GDN prep kernel stages K / Q sixteen bytes a load, and starts V streaming as soon as Q is
   done with** (behind the triangular solve and W^, instead of after them). Same values:
   bit-identical. Prep per layer at 8K tokens 390 -> 341 us.
-- Together: Qwen3.6 prefill 8K 37.1K -> 38.3K tok/s, 2K 29.0K -> 29.6K.
+- **The GDN scan forms both per-row decays once per chunk, in the warp holding the gates, and
+  scales U~ in the same pass that narrows it for the state update** -- three fewer block barriers a
+  chunk. Bit-identical. Scan per layer at 8K tokens 882 -> 858 us.
+- Together: Qwen3.6 prefill 8K 37.1K -> 38.4K tok/s, 2K 29.0K -> 29.7K.
 
 ## [0.6.24] — 2026-10-05
 
