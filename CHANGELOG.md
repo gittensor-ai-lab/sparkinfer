@@ -5,6 +5,16 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+## [0.6.26] — 2026-10-05
+
+**Qwen3.6 prompt processing on 1-2K-token steps +5-8%: the pipelined routed MoE GEMM covers the
+64-row tiles too and keeps 3-4 activation steps in flight. Serving is now level with vLLM on 8K
+prompts at 16 requests and ahead at 16 chat requests.**
+- **Now** (AIPerf streaming chat 1024 / 256, `ignore_eos`, distinct prompts, Qwen3.6-35B-A3B
+  UD-Q4_K_M, RTX 5090): 918 / 1,701 / 2,222 output tok/s at 4 / 16 / 32 requests (c32 2,152 in a
+  second run), 8K-token prompts 522 / 652 at 4 / 16 (vLLM 0.30.0 on nvidia NVFP4: 666 / 1,686 /
+  2,367; 450 / 652). Prefill 1K / 2K / 4K / 8K 24.5K / 32.0K / 37.5K / 38.5K tok/s.
+
 ### Performance
 
 - **The pipelined m16n8k32 routed MoE GEMM also takes 64-row tiles**, the shape the caller builds
