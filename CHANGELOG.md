@@ -5,6 +5,17 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+### Performance
+
+- **The chunked Gated-DeltaNet prefill scan fetches each chunk's gates, U0 and M a chunk ahead.**
+  The scan walks a prompt's 32-token chunks serially, and each chunk began with plain global loads
+  of those three tiles, so every step of the chain waited out a memory round trip before its first
+  barrier. They now come into registers at the end of the previous chunk, beside the W / K / Q
+  cp.async that was already issued there (shared memory has no room for a second plane at two
+  blocks an SM). Same values into the same slots: bit-identical (Qwen3.6 teacher-forced scoring
+  over 1,499 positions matches exactly). Scan per layer at 8K tokens 1,057 -> 882 us; Qwen3.6
+  prefill 8K 37.1K -> 38.0K tok/s, 2K 29.0K -> 29.4K.
+
 ## [0.6.24] — 2026-10-05
 
 **Qwen3.6 prompt processing ~10% faster: the routed MoE prefill GEMM is pipelined and on the

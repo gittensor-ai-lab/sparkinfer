@@ -474,13 +474,44 @@ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
     };
     if (n_chunks > 0) stage_wkq(0);
 
+    // The chunk's gates, U0 and M came in by plain loads at the TOP of each iteration, so every
+    // chunk of this serial chain waited out a global round trip before its first barrier. They are
+    // now fetched into registers at the bottom of the previous iteration, beside the W/K/Q cp.async
+    // (shared memory has no room for a second plane at two blocks an SM), and only stored here.
+    // Same values into the same smem slots: bit-identical.
+    constexpr int GU4 = (C * JC) / 4;                       // == threads: one U quad each
+    constexpr int GM4 = (C * C) / 4;                        // M float4s
+    constexpr int MREG = (GM4 + NTHR - 1) / NTHR;
+    static_assert(GU4 == NTHR, "one U quad a thread");
+    static_assert(C <= NTHR, "one gate a thread");
+    float pf_g = 0.f;
+    ushort4 pf_u = make_ushort4(0, 0, 0, 0);
+    float4 pf_m[MREG];
+    auto fetch_gum = [&](int c2) {
+        const int t0s = c2 * C;
+        const int lens = min(C, n_tokens - t0s);
+        if (tid < C) pf_g = (tid < lens) ? g_buf[(size_t)(t0s + tid) * v_heads + h] : 0.f;
+        {
+            const int e = tid * 4, i = e / JC, jj = e - i * JC;
+            pf_u = (i < lens)
+                ? *reinterpret_cast<const ushort4*>(u_buf + ((size_t)(t0s + i) * v_heads + h) * HD + j0 + jj)
+                : make_ushort4(0, 0, 0, 0);
+        }
+        #pragma unroll
+        for (int r = 0; r < MREG; r++) {
+            const int q4 = tid + r * NTHR;
+            if (q4 < GM4)
+                pf_m[r] = *reinterpret_cast<const float4*>(m_buf + (size_t)q4 * 4 + ((size_t)c2 * v_heads + h) * C * C);
+        }
+    };
+    if (n_chunks > 0) fetch_gum(0);
+
     for (int c = 0; c < n_chunks; c++) {
         const int t0  = c * C;
         const int len = min(C, n_tokens - t0);
 
-        // ---- stage the small linear tiles; W/K/Q arrive via the early-issued cp.async ----
-        for (int i = tid; i < C; i += nthr)
-            s_g[i] = (i < len) ? g_buf[(size_t)(t0 + i) * v_heads + h] : 0.f;
+        // ---- stage the small linear tiles (prefetched in registers); W/K/Q via cp.async ----
+        if (tid < C) s_g[tid] = pf_g;
         // Every per-element loop in this chunk body moves FOUR values at a time. At C=JC=32 each
         // of them is exactly C*JC == 1024 elements over 256 threads, so scalar they are 4 trips of
         // 2-3 memory instructions each; the body is bound by how many load/store instructions it
@@ -492,22 +523,19 @@ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
         constexpr int J4 = (C * JC) / 4;
         static_assert(C % 4 == 0 && JC % 4 == 0 && (C + PAD) % 4 == 0 && (JC + PAD) % 4 == 0,
                       "vector-of-4 staging needs every row stride 4-aligned");
-        for (int q4 = tid; q4 < J4; q4 += nthr) {
-            const int e = q4 * 4, i = e / JC, jj = e - i * JC;
-            if (i < len) {
-                const __nv_bfloat16* up = u_buf + ((size_t)(t0 + i) * v_heads + h) * HD + j0 + jj;
-                const ushort4 u4 = *reinterpret_cast<const ushort4*>(up);
-                const __nv_bfloat16* ub = reinterpret_cast<const __nv_bfloat16*>(&u4);
-                *reinterpret_cast<float4*>(&s_U[e]) =
-                    make_float4(gc_to_f(ub[0]), gc_to_f(ub[1]), gc_to_f(ub[2]), gc_to_f(ub[3]));
-            } else {
-                *reinterpret_cast<float4*>(&s_U[e]) = make_float4(0.f, 0.f, 0.f, 0.f);
-            }
+        {
+            const int e = tid * 4;
+            const __nv_bfloat16* ub = reinterpret_cast<const __nv_bfloat16*>(&pf_u);
+            *reinterpret_cast<float4*>(&s_U[e]) =
+                make_float4(gc_to_f(ub[0]), gc_to_f(ub[1]), gc_to_f(ub[2]), gc_to_f(ub[3]));
         }
-        for (int q4 = tid; q4 < (C * C) / 4; q4 += nthr) {
-            const int e = q4 * 4, i = e / C, j = e - i * C;
-            *reinterpret_cast<float4*>(&s_M[i * (C + PAD) + j]) =
-                *reinterpret_cast<const float4*>(m_buf + (size_t)e + ((size_t)c * v_heads + h) * C * C);
+        #pragma unroll
+        for (int r = 0; r < MREG; r++) {
+            const int q4 = tid + r * NTHR;
+            if (q4 < GM4) {
+                const int e = q4 * 4, i = e / C, j = e - i * C;
+                *reinterpret_cast<float4*>(&s_M[i * (C + PAD) + j]) = pf_m[r];
+            }
         }
         __pipeline_wait_prior(0);
         if (len < C) {
@@ -728,7 +756,10 @@ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
             }
         }
         __syncthreads();
-        if (c + 1 < n_chunks) stage_wkq(c + 1);   // last read of W/K/Q was above this sync
+        if (c + 1 < n_chunks) {
+            stage_wkq(c + 1);   // last read of W/K/Q was above this sync
+            fetch_gum(c + 1);   // registers only: nothing in smem is touched until the next top
+        }
     }
 
     // ---- final state, in the transposed [v_head][col][row] layout decode expects ----
