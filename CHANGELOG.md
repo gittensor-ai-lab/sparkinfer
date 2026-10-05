@@ -7,6 +7,18 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Performance
 
+- **A served packed decode step no longer pins the MoE down projection to its exact-reproduction
+  split.** `dflash_verify_short_run` carries both the speculative verify and plain packed decode,
+  and once a step's first row passed 384 tokens of context it pinned the down's split count the
+  way a long verify chain must to reproduce AR. That put every served Qwen3.6 step on the per-token
+  split-K down (~103 us a layer at 32 rows) and skipped the expert-grouped down. A plain packed
+  step (separate sequences, one token each, 8+ rows) now takes the row-count-aware path; verify
+  chains and grouped verify keep the pin. Qwen3.6 served chat (AIPerf, distinct prompts) c16 / c32
+  1,586 / 1,939 -> 1,666 / 2,193 output tok/s, 8K c16 598 -> 619; c4 and Qwen3.8 unchanged.
+  `SPARKINFER_PACKED_MOE_EXACT=1` restores the pin.
+
+### Performance
+
 - **A packed batch's row GEMVs run their 8-row chunks as one launch** (bf16 row GEMV and the Q8_0
   row MMVQ). Each chunk alone launches N / RPB CTAs -- 128 for Qwen3.6's 256-expert router, 512 for
   its attention k / v -- and at 32 rows four of them ran back to back on the critical path. The

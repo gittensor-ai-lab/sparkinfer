@@ -7415,7 +7415,21 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         // Same bound decides the pinned split count, so short context keeps main's row-count aware
         // S=1 and stays byte-identical; only the long-context path, which needs to reproduce AR,
         // pays the pinned-S choice.
-        const bool moe_exact_splitk = (start_pos + N) > kRowwiseMinSeq;
+        //
+        // A packed decode step (packed_pos set, no verify groups) is not a verify chain: its rows
+        // are separate sequences, each one token, and start_pos is only the first row's position.
+        // Nothing there has to reproduce AR bit for bit, and the pinned split count put every
+        // served step past 384 tokens of context on the per-token split-K down (~103 us a layer
+        // at 32 rows, against ~50-60 for the expert-grouped down it then skipped).
+        // SPARKINFER_PACKED_MOE_EXACT=1 pins it there too, as before.
+        static const bool packed_exact = [] {
+            const char* e = getenv("SPARKINFER_PACKED_MOE_EXACT");
+            return e && e[0] == '1';
+        }();
+        // Below 8 rows the pinned split-K down is the faster one anyway (c4 3.95 against 4.03 ms an
+        // ITL; even at c8, 3% behind from c12), so only wider steps leave it.
+        const bool plain_packed = s.packed_pos && s.group_n == 0 && !packed_exact && N >= 8;
+        const bool moe_exact_splitk = !plain_packed && (start_pos + N) > kRowwiseMinSeq;
         if (moe_rowwise && (start_pos + N) > kRowwiseMinSeq) {
             // Give every row its own scratch slice. Sharing moe_h/moe_out across the loop makes the
             // calls false-dependent, so they serialize and the row loop costs ~28% at 4k; sliced,
