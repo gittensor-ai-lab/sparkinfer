@@ -15,6 +15,11 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
   22.9K / 26.3K / 29.5K -> 24.2K / 27.6K / 31.0K tok/s; served chat c16 / c32 even with 0.6.25
   (1,698 / 2,220 against 1,693 / 2,215, which already had the 128-row kernel).
   `SPARKINFER_PREFILL_MOE_K32=0` keeps both tile heights on the previous kernels.
+- **That kernel keeps three (128-row) or four (64-row) activation K-steps in flight instead of
+  one.** Its MMAs per step are too short to cover the next step's L2 fetch, so with two buffers
+  every step waited it out -- sixteen times a tile at the down's K=512. At a 1K-token step gate /
+  up 139 -> 128 us, down 210 -> 195 us; prefill 1K / 2K / 4K 24.2K / 31.0K / 37.1K -> 24.5K /
+  32.0K / 37.5K tok/s. Same values, same order.
 
 ## [0.6.25] — 2026-10-05
 
