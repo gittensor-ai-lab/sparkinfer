@@ -7,6 +7,12 @@ sparkinfer's public baseline uses Qwen3-30B-A3B `Q4_K_M` GGUF. vLLM and
 TensorRT-LLM normally benchmark Hugging Face quantized checkpoints such as FP8,
 NVFP4, or GPTQ. Record the exact weight format with every result.
 
+## Serving head-to-head (current)
+
+[`serving/`](serving/README.md) holds the scripts behind the README's serving tables: the
+standard AIPerf cells, speculative decoding with a DFlash draft, and long prompts, sparkinfer
+against vLLM on the same GPU, with the latest reference results.
+
 ## Run
 
 ```bash
