@@ -228,9 +228,10 @@ Time to first token in ms (p50 / p90 / p99):
 - **Still behind:** time to first token in the 8K-prompt cells at 16+ requests, 1.6 / 14.2 s p50
   against vLLM's 1.2 / 12.4.
 - **Smaller `--ctx`:** the KV pool grows into the memory left free after startup (0.6.18), so it
-  no longer caps concurrency at one `--ctx` of tokens. At `--ctx 32768` without a drafter, 0.6.25
-  against vLLM 0.30.0: chat 314 / 908 / 1,259 vs 271 / 862 / 1,239 tok/s at 4 / 16 / 32 requests,
-  8K prompts 188 / 310 vs 187 / 306 at 4 / 16.
+  no longer caps concurrency at one `--ctx` of tokens. At `--ctx 32768` without a drafter, 0.6.29
+  against vLLM 0.30.0 the same day: chat **323** / **914** / **1,288** vs 272 / 867 / 1,246 tok/s at
+  4 / 16 / 32 requests, 8K prompts **193** / **312** vs 189 / 308 at 4 / 16; TTFT p50 at 32 chat
+  requests 387 vs 1,217 ms.
 
 ### Same weights, GGUF on both sides
 
@@ -275,20 +276,20 @@ Full tables: [`bench/competitors/latest-results.md`](bench/competitors/latest-re
 [`bench/quality/README.md`](bench/quality/README.md).
 
 Serving concurrent requests (AIPerf, streaming chat 1024 / 256 with `ignore_eos`, a distinct
-prompt set per cell, RTX 5090). sparkinfer 0.6.28 serves the UD-Q4_K_M GGUF, `llama-server`
+prompt set per cell, RTX 5090). sparkinfer 0.6.29 serves the UD-Q4_K_M GGUF, `llama-server`
 (llama.cpp `436f6f8`, `-np 32 -fa on`, measured on 0.6.17's run) the same file, and vLLM 0.30.0
 its best format on this card, `nvidia/Qwen3.6-35B-A3B-NVFP4`:
 
 | requests | output tok/s | TTFT p50 (ms) | ITL p50 (ms) |
 |---:|---:|---:|---:|
 | | **sparkinfer** / llama.cpp / vLLM | **sparkinfer** / llama.cpp / vLLM | **sparkinfer** / llama.cpp / vLLM |
-| 4 | **973** / 339 / 661 | **123** / 1,329 / 195 | **3.7** / 7.2 / 5.3 |
-| 16 | **1,749** / 372 / 1,689 | **265** / 2,493 / 434 | 8.2 / 33.2 / **7.8** |
-| 32 | **2,366** / 404 / **2,366** | **318** / 2,436 / 580 | 12.4 / 69.0 / **11.3** |
+| 4 | **976** / 339 / 669 | **117** / 1,329 / 176 | **3.6** / 7.2 / 5.3 |
+| 16 | **1,769** / 372 / 1,695 | **266** / 2,493 / 396 | 8.1 / 33.2 / **7.9** |
+| 32 | **2,405** / 404 / 2,364 | **313** / 2,436 / 539 | 12.3 / 69.0 / **11.4** |
 
-8K-token prompts, 4 / 16 requests: sparkinfer **575** / **664** tok/s, vLLM 451 / 652. At 32
-requests the two are level on throughput; sparkinfer's first token is 45% sooner and vLLM's
-inter-token latency 9% lower. sparkinfer refits this checkpoint's Q8_0 attention and
+8K-token prompts, 4 / 16 requests: sparkinfer **588** / **674** tok/s, vLLM 452 / 654. sparkinfer
+leads every cell on throughput and first token; vLLM keeps a lower inter-token latency at 16-32
+requests (~3-8%). sparkinfer refits this checkpoint's Q8_0 attention and
 Q5_K expert-down tensors to Q4_K at load (perplexity within ~2% either way over three 4K-token
 corpus slices); `SPARKINFER_ATTN_REQUANT_Q4K=0` / `SPARKINFER_MOE_DOWN_REQUANT_Q4K=0` keep the
 GGUF's own tensors.

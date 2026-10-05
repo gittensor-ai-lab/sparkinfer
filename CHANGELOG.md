@@ -5,6 +5,16 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+## [0.6.29] — 2026-10-05
+
+**Long-prompt prefill +4-8% on both models (a 2.2x faster Gated-DeltaNet scan). In one same-day
+run against vLLM 0.30.0, sparkinfer leads all ten serving cells on both Qwen3.6 and Qwen3.8.**
+- **Now** (AIPerf streaming chat 1024 / 256, `ignore_eos`, distinct prompts, RTX 5090, vLLM on the
+  same box the same hour): Qwen3.6-35B-A3B UD-Q4_K_M 976 / 1,769 / 2,405 output tok/s at 4 / 16 /
+  32 requests, 8K prompts 588 / 674 (vLLM on nvidia NVFP4: 669 / 1,695 / 2,364; 452 / 654).
+  Qwen3.8-27B NVFP4 (`--ctx 32768`, no drafter) 323 / 914 / 1,288, 8K 193 / 312 (vLLM 272 / 867 /
+  1,246; 189 / 308).
+
 ### Performance
 
 - **The Gated-DeltaNet prefill scan keeps each warp's state columns in registers**
