@@ -275,20 +275,20 @@ Full tables: [`bench/competitors/latest-results.md`](bench/competitors/latest-re
 [`bench/quality/README.md`](bench/quality/README.md).
 
 Serving concurrent requests (AIPerf, streaming chat 1024 / 256 with `ignore_eos`, a distinct
-prompt set per cell, RTX 5090). sparkinfer 0.6.27 serves the UD-Q4_K_M GGUF, `llama-server`
+prompt set per cell, RTX 5090). sparkinfer 0.6.28 serves the UD-Q4_K_M GGUF, `llama-server`
 (llama.cpp `436f6f8`, `-np 32 -fa on`, measured on 0.6.17's run) the same file, and vLLM 0.30.0
 its best format on this card, `nvidia/Qwen3.6-35B-A3B-NVFP4`:
 
 | requests | output tok/s | TTFT p50 (ms) | ITL p50 (ms) |
 |---:|---:|---:|---:|
 | | **sparkinfer** / llama.cpp / vLLM | **sparkinfer** / llama.cpp / vLLM | **sparkinfer** / llama.cpp / vLLM |
-| 4 | **944** / 339 / 661 | **162** / 1,329 / 195 | **3.7** / 7.2 / 5.3 |
-| 16 | **1,739** / 372 / 1,689 | **274** / 2,493 / 434 | 8.2 / 33.2 / **7.8** |
-| 32 | 2,246 / 404 / **2,366** | **385** / 2,436 / 580 | 13.2 / 69.0 / **11.3** |
+| 4 | **973** / 339 / 661 | **123** / 1,329 / 195 | **3.7** / 7.2 / 5.3 |
+| 16 | **1,749** / 372 / 1,689 | **265** / 2,493 / 434 | 8.2 / 33.2 / **7.8** |
+| 32 | **2,366** / 404 / **2,366** | **318** / 2,436 / 580 | 12.4 / 69.0 / **11.3** |
 
-8K-token prompts, 4 / 16 requests: sparkinfer **574** / **665** tok/s, vLLM 451 / 652. vLLM
-still leads Qwen3.6 at 32 concurrent requests (by ~5%): the prompt work mixed into decode steps is
-where the remaining gap is being worked on. sparkinfer refits this checkpoint's Q8_0 attention and
+8K-token prompts, 4 / 16 requests: sparkinfer **575** / **664** tok/s, vLLM 451 / 652. At 32
+requests the two are level on throughput; sparkinfer's first token is 45% sooner and vLLM's
+inter-token latency 9% lower. sparkinfer refits this checkpoint's Q8_0 attention and
 Q5_K expert-down tensors to Q4_K at load (perplexity within ~2% either way over three 4K-token
 corpus slices); `SPARKINFER_ATTN_REQUANT_Q4K=0` / `SPARKINFER_MOE_DOWN_REQUANT_Q4K=0` keep the
 GGUF's own tensors.

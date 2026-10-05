@@ -5,6 +5,15 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+## [0.6.28] — 2026-10-05
+
+**Qwen3.6 serving at 32 chat requests +5%, now level with vLLM (2,366 tok/s each), with a 45%
+faster first token. sparkinfer now matches or beats vLLM in every Qwen3.6 serving cell.**
+- **Now** (AIPerf streaming chat 1024 / 256, `ignore_eos`, distinct prompts, Qwen3.6-35B-A3B
+  UD-Q4_K_M, RTX 5090, two runs each): 973 / 1,749 / 2,366 output tok/s at 4 / 16 / 32 requests,
+  8K-token prompts 575 / 664 at 4 / 16 (vLLM 0.30.0 on nvidia NVFP4, same box and harness: 661 /
+  1,689 / 2,366; 451 / 652). TTFT p50 at 32 requests 318 ms against vLLM's 580. Qwen3.8 unchanged.
+
 ### Performance
 
 - **A burst of Qwen3.6 prompts is prefilled in packed passes.** At 32 concurrent chat requests
@@ -23,8 +32,6 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
   1,739 / 2,246 -> 973 / 1,749 / 2,366 output tok/s, TTFT p50 at c32 385 -> 318 ms; 8K c4 / c16
   574 / 665 -> 575 / 664. `pack_ckpt_check` now opens GGUF checkpoints and passes on Qwen3.6
   and Qwen3.8 (same seeds alone and packed).
-
-### Performance
 
 - **The pipelined routed MoE GEMM takes one barrier a K step instead of two**: the next activation
   step is issued after the step's own barrier (which already proves every warp is past the slot
