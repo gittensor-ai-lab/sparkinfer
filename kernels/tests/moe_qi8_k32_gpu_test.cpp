@@ -6,7 +6,8 @@
 //
 // SPARKINFER_PREFILL_MOE_K32 is read once per process, so each arm runs in a forked child and pipes
 // its outputs back. Experts carry 0 to 300 pairs, so a block may own a full 128-row tile, a partial
-// one, or the second tile of an expert. Q4_K, Q5_K and Q6_K each run both forms.
+// one, or the second tile of an expert. Q4_K, Q5_K and Q6_K each run both forms, at 128- and
+// 64-row tiles (the 64-row reference is the bm16-family kernel the caller used for those).
 #include "sparkinfer/kernels/prefill_moe_q.h"
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -24,7 +25,7 @@ namespace {
 
 constexpr int E = 6, T = 400;                      // experts, tokens
 const int kCnt[E] = {300, 0, 128, 37, 129, 6};     // pairs per expert
-constexpr int BM = 128;
+constexpr int kBMs[2] = {128, 64};          // the tile heights the caller builds tilemaps for
 
 unsigned int rng = 0x13579bdu;
 unsigned next_u() { rng = rng * 1664525u + 1013904223u; return rng >> 8; }
@@ -56,7 +57,10 @@ const Case kCases[] = {
     {14, 210, 512, 2048, false},   // Q6_K, decoded from global (no register stage)
     {14, 210, 2048, 512, true},    // Q6_K down
 };
-constexpr int NC = sizeof(kCases) / sizeof(kCases[0]);
+constexpr int NQ = sizeof(kCases) / sizeof(kCases[0]);
+constexpr int NC = 2 * NQ;                 // every case at both tile heights
+const Case& case_of(int ci) { return kCases[ci % NQ]; }
+int bm_of(int ci) { return kBMs[ci / NQ]; }
 
 size_t out_floats(const Case& c, int P) { return c.scatter ? (size_t)T * c.n_out : (size_t)P * c.n_out; }
 
@@ -65,25 +69,27 @@ int child(int fd) {
     std::vector<int> offs(E + 1, 0);
     for (int e = 0; e < E; ++e) { offs[e] = P; P += kCnt[e]; }
     offs[E] = P;
-    std::vector<int> tm;
-    for (int e = 0; e < E; ++e)
-        for (int mt = 0; mt * BM < kCnt[e]; ++mt) { tm.push_back(e); tm.push_back(mt); }
-    const int ntiles = (int)tm.size() / 2, max_tiles = P / BM + E;
     std::vector<int> ptok(P);
     std::vector<float> pw(P);
     for (int p = 0; p < P; ++p) { ptok[p] = (int)(next_u() % T); pw[p] = 0.1f + 0.2f * std::fabs(next_unit()); }
     int *d_offs, *d_tm, *d_nt, *d_ptok;
     float *d_pw;
-    bool ok = cudaMalloc(&d_offs, offs.size() * 4) == cudaSuccess && cudaMalloc(&d_tm, tm.size() * 4) == cudaSuccess &&
+    bool ok = cudaMalloc(&d_offs, offs.size() * 4) == cudaSuccess && cudaMalloc(&d_tm, 2 * (P + E) * 4) == cudaSuccess &&
               cudaMalloc(&d_nt, 4) == cudaSuccess && cudaMalloc(&d_ptok, P * 4) == cudaSuccess &&
               cudaMalloc(&d_pw, P * 4) == cudaSuccess &&
               cudaMemcpy(d_offs, offs.data(), offs.size() * 4, cudaMemcpyHostToDevice) == cudaSuccess &&
-              cudaMemcpy(d_tm, tm.data(), tm.size() * 4, cudaMemcpyHostToDevice) == cudaSuccess &&
-              cudaMemcpy(d_nt, &ntiles, 4, cudaMemcpyHostToDevice) == cudaSuccess &&
               cudaMemcpy(d_ptok, ptok.data(), P * 4, cudaMemcpyHostToDevice) == cudaSuccess &&
               cudaMemcpy(d_pw, pw.data(), P * 4, cudaMemcpyHostToDevice) == cudaSuccess;
     for (int ci = 0; ok && ci < NC; ++ci) {
-        const Case& c = kCases[ci];
+        const Case& c = case_of(ci);
+        const int BM = bm_of(ci);
+        std::vector<int> tm;
+        for (int e = 0; e < E; ++e)
+            for (int mt = 0; mt * BM < kCnt[e]; ++mt) { tm.push_back(e); tm.push_back(mt); }
+        const int ntiles = (int)tm.size() / 2, max_tiles = P / BM + E;
+        ok = cudaMemcpy(d_tm, tm.data(), tm.size() * 4, cudaMemcpyHostToDevice) == cudaSuccess &&
+             cudaMemcpy(d_nt, &ntiles, 4, cudaMemcpyHostToDevice) == cudaSuccess;
+        if (!ok) break;
         const int rows_a = c.scatter ? P : T;          // down: A is per pair (h); gate/up: per token
         std::vector<signed char> a((size_t)rows_a * c.K);
         for (auto& v : a) v = (signed char)((int)(next_u() % 255) - 127);
@@ -136,7 +142,7 @@ bool run(const char* k32, std::vector<std::vector<float>>& outs) {
     outs.assign(NC, {});
     bool ok = true;
     for (int ci = 0; ok && ci < NC; ++ci) {
-        outs[ci].resize(out_floats(kCases[ci], P));
+        outs[ci].resize(out_floats(case_of(ci), P));
         size_t got = 0, want = outs[ci].size() * 4;
         for (ssize_t n; got < want && (n = read(fds[0], reinterpret_cast<char*>(outs[ci].data()) + got, want - got)) > 0;)
             got += (size_t)n;
@@ -162,7 +168,8 @@ int main() {
     if (!run("0", ref) || !run("1", got)) { std::printf("[FAIL] a run failed\n"); return 1; }
     bool ok = true;
     for (int ci = 0; ci < NC; ++ci) {
-        const Case& c = kCases[ci];
+        const Case& c = case_of(ci);
+        const int BM = bm_of(ci);
         const auto& a = got[ci];
         const auto& b = ref[ci];
         size_t nonzero = 0;
@@ -170,10 +177,10 @@ int main() {
         if (nonzero < b.size() / 4) { std::printf("[FAIL] case %d: reference mostly zero\n", ci); ok = false; continue; }
         if (!c.scatter) {
             if (std::memcmp(a.data(), b.data(), a.size() * 4) != 0) {
-                std::printf("[FAIL] case %d (qtype %d, %dx%d): bf16 output differs\n", ci, c.qtype, c.n_out, c.K);
+                std::printf("[FAIL] case %d (qtype %d, %dx%d, BM %d): bf16 output differs\n", ci, c.qtype, c.n_out, c.K, BM);
                 ok = false;
             } else {
-                std::printf("[PASS] case %d (qtype %d, %dx%d): bit-identical\n", ci, c.qtype, c.n_out, c.K);
+                std::printf("[PASS] case %d (qtype %d, %dx%d, BM %d): bit-identical\n", ci, c.qtype, c.n_out, c.K, BM);
             }
             continue;
         }
@@ -181,10 +188,10 @@ int main() {
         for (float v : b) amax = std::max(amax, (double)std::fabs(v));
         for (size_t i = 0; i < a.size(); ++i) worst = std::max(worst, std::fabs((double)a[i] - b[i]));
         if (worst > 1e-5 * amax) {
-            std::printf("[FAIL] case %d (qtype %d scatter): max |diff| %.3g vs max %.3g\n", ci, c.qtype, worst, amax);
+            std::printf("[FAIL] case %d (qtype %d scatter, BM %d): max |diff| %.3g vs max %.3g\n", ci, c.qtype, BM, worst, amax);
             ok = false;
         } else {
-            std::printf("[PASS] case %d (qtype %d scatter): within float reordering (%.2g of max)\n", ci, c.qtype,
+            std::printf("[PASS] case %d (qtype %d scatter, BM %d): within float reordering (%.2g of max)\n", ci, c.qtype, BM,
                         amax > 0 ? worst / amax : 0.0);
         }
     }

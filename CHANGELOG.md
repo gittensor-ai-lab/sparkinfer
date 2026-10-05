@@ -5,6 +5,17 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+### Performance
+
+- **The pipelined m16n8k32 routed MoE GEMM also takes 64-row tiles**, the shape the caller builds
+  for 512-2048-token prefills and mixed steps, which ran on the bm16-family kernel: at a 1K-token
+  step gate / up 150 -> 139 us and the Q5_K down 229 -> 210 us a layer. Eight warps sit 2 x 4 (32
+  rows x 16 columns) instead of 4 x 2; same tilemap, int8 bytes and int32 sums, bf16 output
+  bit-identical (the GPU test now covers both tile heights). Qwen3.6 prefill 1K / 1.5K / 2K
+  22.9K / 26.3K / 29.5K -> 24.2K / 27.6K / 31.0K tok/s; served chat c16 / c32 even with 0.6.25
+  (1,698 / 2,220 against 1,693 / 2,215, which already had the 128-row kernel).
+  `SPARKINFER_PREFILL_MOE_K32=0` keeps both tile heights on the previous kernels.
+
 ## [0.6.25] — 2026-10-05
 
 **Gated-DeltaNet prompt processing: the chunked scan ~19% and its prep kernel ~13% faster, output
