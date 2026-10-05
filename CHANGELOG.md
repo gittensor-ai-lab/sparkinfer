@@ -5,6 +5,16 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+## [0.6.27] — 2026-10-05
+
+**Qwen3.6 serving +3-10%: its routed expert downs are read at 4.5 bits a weight instead of 5.5.
+sparkinfer now leads vLLM in four of five Qwen3.6 serving cells, and trails only at 32 chat
+requests (by ~5%).**
+- **Now** (AIPerf streaming chat 1024 / 256, `ignore_eos`, distinct prompts, Qwen3.6-35B-A3B
+  UD-Q4_K_M, RTX 5090): 944 / 1,739 / 2,246 output tok/s at 4 / 16 / 32 requests, 8K-token prompts
+  574 / 665 at 4 / 16 (vLLM 0.30.0 on nvidia NVFP4, re-measured the same day: 661 / 1,689 / 2,366;
+  451 / 652). Qwen3.8 unchanged.
+
 ### Performance
 
 - **Qwen3.6's routed expert downs are refit from Q5_K to Q4_K at load**, so each routed down read
