@@ -296,6 +296,8 @@ public:
     // the committed position, so ordinary decode can take over from SpecResume::position with
     // SpecResume::next_token and produce what the speculative loop would have.
     struct RecurrentStateSnapshot;   // defined below, with snapshot_recurrent_state
+    // Pin the prefix cache's snapshot buffers ahead of serving (see snapshot_pool_warm in qwen35.cpp).
+    void warm_snapshot_pool();
     struct SpecHooks {
         uint64_t seq_id = 0;
         // A prefix-cache hit: the session's KV for [0, prefill_start) is shared in and its

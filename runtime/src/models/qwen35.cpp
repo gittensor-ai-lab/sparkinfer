@@ -4377,8 +4377,10 @@ struct Qwen35Model::SnapshotBuffer {
 
 namespace {
 // Defined with the snapshot pool below.
-std::shared_ptr<Qwen35Model::SnapshotBuffer> pinned_snapshot_buffer(size_t bytes);
+std::shared_ptr<Qwen35Model::SnapshotBuffer> pinned_snapshot_buffer(size_t bytes, bool pool_only = false);
 void snapshot_filled(const std::shared_ptr<Qwen35Model::SnapshotBuffer>& b);
+void snapshot_pool_warm(size_t bytes, size_t n);
+size_t snapshot_pool_cap_bytes();
 }  // namespace
 
 bool Qwen35Model::ingest_prompts_packed(const uint64_t* seq_ids, const int* const* prompts,
@@ -4388,7 +4390,15 @@ bool Qwen35Model::ingest_prompts_packed(const uint64_t* seq_ids, const int* cons
     std::lock_guard<std::recursive_mutex> device_lock(p_->device_mu);
     Impl& s = *p_;
     if (!seq_ids || !prompts || !lens_in || !seeds || n_prompts < 2) return false;
-    if (!s.gguf || !s.cfg.hybrid || !s.cfg.dense_ffn) return false;
+    // MoE checkpoints pack too (Qwen3.6-35B-A3B): the routed FFN is per token, and the mixed steps
+    // already carry several prompts through the same pass. Left dense-only, every prompt of a
+    // burst on Qwen3.6 took a pass of its own -- 32 arriving 1K-token prompts ran at half vLLM's
+    // rate. SPARKINFER_PACK_MOE=0 keeps MoE models on one pass per prompt.
+    static const bool pack_moe = [] {
+        const char* e = getenv("SPARKINFER_PACK_MOE");
+        return !(e && e[0] == '0');
+    }();
+    if (!s.gguf || !s.cfg.hybrid || !(s.cfg.dense_ffn || pack_moe)) return false;
     if (ckpt_rows && !snaps) return false;
     // lens: what the pass itself ingests; one prompt may be trimmed below (see `trimmed`).
     std::vector<int> lens_v(lens_in, lens_in + n_prompts);
@@ -4477,8 +4487,12 @@ bool Qwen35Model::ingest_prompts_packed(const uint64_t* seq_ids, const int* cons
     for (int i = 0; ckpt_rows && i < n_prompts; ++i) {
         if (ckpt_rows[i] <= 0) continue;
         if (!linear) return false;
-        ck_bufs[(size_t)i] = pinned_snapshot_buffer(ck_st_bytes + ck_cv_bytes);
-        if (!ck_bufs[(size_t)i]) return false;
+        // From the warmed pool only. A burst bigger than the pool skips the checkpoints it has no
+        // buffer for (those prompts are just not offered to the prefix cache) rather than pinning
+        // fresh memory mid-pass: that driver call stalls the step, and a pack's checkpoints are
+        // all taken in the same pass. The migration thread hands buffers back as it drains.
+        ck_bufs[(size_t)i] = pinned_snapshot_buffer(ck_st_bytes + ck_cv_bytes, /*pool_only=*/true);
+        if (!ck_bufs[(size_t)i]) continue;
         ck_host[(size_t)i] = ck_bufs[(size_t)i]->data;
         // The pass writes the GDN layers' windows; the attention layers' slots stay zero.
         memset(static_cast<char*>(ck_host[(size_t)i]) + ck_st_bytes, 0, ck_cv_bytes);
@@ -4863,7 +4877,19 @@ int Qwen35Model::prefill_batched_resume(const int* prompt_ids, int start, int en
 // back to the free list when the snapshot goes); SPARKINFER_SNAPSHOT_POOL=0 also stops reusing
 // them. Nothing here is ever destroyed: a snapshot can outlive every other static at exit.
 namespace {
-constexpr size_t kSnapshotPoolMax = 8;
+constexpr size_t kSnapshotPoolMax = 8;   // at least this many free buffers per list
+// ...and up to this many bytes of them (SPARKINFER_SNAPSHOT_POOL_MB, default 4096). A count of 8
+// let a burst of chat prompts -- each packed prompt takes its checkpoint snapshot in the same pass
+// -- pin and free a fresh buffer for all but eight of them: 32 arriving 1K-token prompts on
+// Qwen3.6 (63 MB a snapshot) spent ~0.4 s of their ~1.4 s in cudaHostAlloc / cudaFreeHost.
+size_t snapshot_pool_cap_bytes() {
+    static const size_t v = [] {
+        const char* e = getenv("SPARKINFER_SNAPSHOT_POOL_MB");
+        const long long mb = e ? atoll(e) : 4096;
+        return (size_t)(mb > 0 ? mb : 0) << 20;
+    }();
+    return v;
+}
 struct SnapshotPool {
     std::mutex mu;
     size_t bytes = 0;
@@ -4872,6 +4898,7 @@ struct SnapshotPool {
     std::condition_variable cv;
     std::deque<std::shared_ptr<Qwen35Model::SnapshotBuffer>> todo;
     bool worker_started = false;
+    bool warmed = false;   // snapshot_pool_warm filled the lists for `bytes`
 };
 SnapshotPool& snapshot_pool() {
     static SnapshotPool* p = new SnapshotPool;
@@ -4894,6 +4921,7 @@ bool snapshot_migrate_on() {
 // Called with p.mu held: a different model's snapshot size empties the free lists.
 void snapshot_pool_resize(SnapshotPool& p, size_t bytes) {
     if (p.bytes == bytes) return;
+    p.warmed = false;
     for (void* f : p.pinned) cudaFreeHost(f);
     for (void* f : p.pageable) free(f);
     p.pinned.clear();
@@ -4906,7 +4934,8 @@ void snapshot_release(void* data, size_t bytes, bool pinned) {
         SnapshotPool& p = snapshot_pool();
         std::lock_guard<std::mutex> lock(p.mu);
         std::vector<void*>& list = pinned ? p.pinned : p.pageable;
-        if (p.bytes == bytes && list.size() < kSnapshotPoolMax) {
+        if (p.bytes == bytes && (list.size() < kSnapshotPoolMax ||
+                                 (list.size() + 1) * bytes <= snapshot_pool_cap_bytes())) {
             list.push_back(data);
             return;
         }
@@ -4914,18 +4943,24 @@ void snapshot_release(void* data, size_t bytes, bool pinned) {
     if (pinned) cudaFreeHost(data);
     else free(data);
 }
-// A pinned buffer for a snapshot about to be filled by a device copy.
-std::shared_ptr<Qwen35Model::SnapshotBuffer> pinned_snapshot_buffer(size_t bytes) {
+// A pinned buffer for a snapshot about to be filled by a device copy. pool_only: once the pool has
+// been warmed for this size (a server with the prefix cache on), take one from the free list or
+// return nullptr -- never pin a new one mid-pass (see the packed prefill's use). An unwarmed pool
+// pins on demand as before.
+std::shared_ptr<Qwen35Model::SnapshotBuffer> pinned_snapshot_buffer(size_t bytes, bool pool_only) {
     void* host = nullptr;
+    bool warmed = false;
     if (snapshot_pool_on()) {
         SnapshotPool& p = snapshot_pool();
         std::lock_guard<std::mutex> lock(p.mu);
         snapshot_pool_resize(p, bytes);
+        warmed = p.warmed;
         if (!p.pinned.empty()) {
             host = p.pinned.back();
             p.pinned.pop_back();
         }
     }
+    if (!host && pool_only && warmed) return nullptr;
     if (!host && (cudaHostAlloc(&host, bytes, cudaHostAllocPortable) != cudaSuccess || !host))
         return nullptr;
     auto b = std::make_shared<Qwen35Model::SnapshotBuffer>();
@@ -4974,6 +5009,30 @@ void snapshot_migrate_worker() {
     }
 }
 // Called once a snapshot's device copy has landed.
+// Fill the free lists ahead of serving: `n` pinned buffers of `bytes` (and as many pageable ones,
+// first-touched, for the migration thread to move snapshots into). Each list is bounded by the
+// caller's `n` (warm_snapshot_pool keeps n * bytes within SPARKINFER_SNAPSHOT_POOL_MB), so the two
+// together hold at most twice that in host memory. Pinning a 63 MB buffer is a
+// long driver call that stalls the CUDA work around it; done for every snapshot of a burst, it was
+// ~1 s of a 4 s window of 32-prompt bursts on Qwen3.6 with the GPU idle a third of the time.
+void snapshot_pool_warm(size_t bytes, size_t n) {
+    if (!snapshot_pool_on() || bytes == 0 || n == 0) return;
+    SnapshotPool& p = snapshot_pool();
+    std::lock_guard<std::mutex> lock(p.mu);
+    snapshot_pool_resize(p, bytes);
+    while (p.pinned.size() < n) {
+        void* h = nullptr;
+        if (cudaHostAlloc(&h, bytes, cudaHostAllocPortable) != cudaSuccess || !h) break;
+        p.pinned.push_back(h);
+    }
+    while (snapshot_migrate_on() && p.pageable.size() < n) {
+        void* h = malloc(bytes);
+        if (!h) break;
+        std::memset(h, 0, bytes);   // first touch now, not under a burst
+        p.pageable.push_back(h);
+    }
+    p.warmed = !p.pinned.empty();
+}
 void snapshot_filled(const std::shared_ptr<Qwen35Model::SnapshotBuffer>& b) {
     if (!b || !b->pinned || !snapshot_migrate_on()) return;
     SnapshotPool& p = snapshot_pool();
@@ -4997,6 +5056,19 @@ std::vector<char> Qwen35Model::snapshot_bytes(const RecurrentStateSnapshot& snap
     const char* d = static_cast<const char*>(snap.host->data);
     out.assign(d, d + snap.host->bytes);
     return out;
+}
+
+void Qwen35Model::warm_snapshot_pool() {
+    Impl& s = *p_;
+    if (!needs_linear_state(s.cfg)) return;
+    const size_t st_bytes = (size_t)gdn_state_slots(s.cfg) * s.cfg.linear_v_heads * s.cfg.linear_head_dim *
+                            s.cfg.linear_head_dim * sizeof(float);
+    const size_t cv_bytes = (size_t)s.cfg.n_layers * (s.cfg.linear_conv_kernel - 1) *
+                            s.linear_qkvdim * sizeof(bf16);
+    const size_t bytes = st_bytes + cv_bytes;
+    // Two bursts' worth (64 prompts), within the pool's byte cap.
+    const size_t n = std::min<size_t>(64, bytes ? snapshot_pool_cap_bytes() / bytes : 0);
+    snapshot_pool_warm(bytes, n);
 }
 
 bool Qwen35Model::snapshot_recurrent_state(uint64_t seq_id, RecurrentStateSnapshot& out) {

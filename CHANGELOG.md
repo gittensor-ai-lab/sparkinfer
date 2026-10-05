@@ -7,6 +7,25 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Performance
 
+- **A burst of Qwen3.6 prompts is prefilled in packed passes.** At 32 concurrent chat requests
+  AIPerf's closed loop starts every wave with ~32 prompts and nothing decoding, and on Qwen3.6
+  each of them ran a pass of its own: a prompt-only burst (32 x 1K tokens, one output token) ran
+  18.9 requests/s against vLLM's 37.4. Four things kept it out of the pack: the packed ingest
+  required a dense FFN and the batched pass refused an MoE pack without decode rows (the routed
+  FFN is per row; `SPARKINFER_PACK_MOE=0` restores both); a chat prompt's prefix-cache checkpoint
+  sits ~12 tokens before its end, under the pack's 16-token margin (now moved back a block -- the
+  next turn still matches it); checkpointed prompts ran their GDN conv / scan and snapshot copies
+  serially on the pass's stream (now on their segment streams); and each snapshot pinned a fresh
+  host buffer mid-pass (~1 s of a 4 s burst window in cudaHostAlloc). The snapshot pool is now
+  sized in bytes (`SPARKINFER_SNAPSHOT_POOL_MB`, 4096), warmed when the prefix cache is enabled,
+  and a packed pass takes its buffers from it only (a prompt without one skips its checkpoint).
+  Prompt-only burst 18.9 -> ~30 requests/s. Served chat (AIPerf, two runs) c4 / c16 / c32 944 /
+  1,739 / 2,246 -> 973 / 1,749 / 2,366 output tok/s, TTFT p50 at c32 385 -> 318 ms; 8K c4 / c16
+  574 / 665 -> 575 / 664. `pack_ckpt_check` now opens GGUF checkpoints and passes on Qwen3.6
+  and Qwen3.8 (same seeds alone and packed).
+
+### Performance
+
 - **The pipelined routed MoE GEMM takes one barrier a K step instead of two**: the next activation
   step is issued after the step's own barrier (which already proves every warp is past the slot
   being refilled), so the barrier at the bottom of every step goes. Phase timing (clock64) had the

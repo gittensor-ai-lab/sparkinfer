@@ -412,10 +412,16 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     if (multi) {
         // Muse's attention branch loops its prompts itself, on either cache dtype; every other
         // stack takes the int8 per-prompt loop further down.
-        // An MoE stack packs only as a mixed step's chunks (ingest_prompts_packed wants a dense FFN):
-        // the routed FFN is row-wise, so a pack's rows need nothing of it the one-prompt pass does
-        // not already do.
-        if (pos0 != 0 || (moe && s.mix_n <= 0) || (!c.muse_glimmer && !s.kv->int8_kv())) return -1;
+        // The routed FFN is row-wise, so a pack's rows need nothing of it the one-prompt pass does
+        // not already do: an MoE stack packs as a mixed step's chunks and, with no decode rows
+        // beside them, as a burst of fresh prompts (ingest_prompts_packed).
+        // SPARKINFER_PACK_MOE=0 keeps the latter to one pass per prompt.
+        static const bool pack_moe = [] {
+            const char* e = getenv("SPARKINFER_PACK_MOE");
+            return !(e && e[0] == '0');
+        }();
+        if (pos0 != 0 || (moe && s.mix_n <= 0 && !pack_moe) || (!c.muse_glimmer && !s.kv->int8_kv()))
+            return -1;
         if (s.capture_dst || s.vision_emb || s.mrope_pos || s.packed_rows || s.ckpt_n > 0) return -1;
         if (!s.multi_off || !s.multi_len || !s.multi_seq_ids || (!s.multi_seed && !s.multi_no_seed))
             return -1;
@@ -2744,11 +2750,16 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     const size_t o = (size_t)s.multi_off[i];
                     const int len = s.multi_len[i];
                     const int ck = s.multi_ckpt_row ? s.multi_ckpt_row[i] : 0;
+                    const int j = i % ns;
+                    cudaStream_t ss = j ? seg_st[j] : st;
                     if (ck > 0 && ck < len && s.multi_ckpt_host && s.multi_ckpt_host[i]) {
-                        // This prompt's checkpoint: its conv and scan in two parts on the pass's
-                        // stream -- the staging buffer the second part's conv reads its window
-                        // from is shared -- with this layer's state and window copied to the
-                        // snapshot between them, as the one-prompt path does.
+                        // This prompt's checkpoint: its conv and scan in two parts, with this
+                        // layer's state and window copied to the snapshot between them, as the
+                        // one-prompt path does -- on the prompt's own segment stream, staging the
+                        // second part's conv window in that stream's slot. (They used to run on the
+                        // pass's stream through one shared staging buffer, so a pack of chat prompts
+                        // -- every one with a checkpoint -- scanned its prompts one after another.)
+                        // The scan's workspace slot is the stream's too, as for any segment.
                         const size_t conv_elems = (size_t)(c.linear_conv_kernel - 1) * lqkv;
                         const size_t state_elems = (size_t)vh * c.linear_head_dim * c.linear_head_dim;
                         bf16* conv_state = static_cast<bf16*>(s.multi_lin_conv[i]) + conv_at;
@@ -2757,30 +2768,28 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                             const size_t po = o + (part ? (size_t)ck : 0);
                             const int plen = part ? len - ck : ck;
                             if (part)
-                                pf_cu(cudaMemcpyAsync(cprev, conv_state, conv_elems * sizeof(bf16),
-                                                      cudaMemcpyDeviceToDevice, st), "gdn conv carry-in");
+                                pf_cu(cudaMemcpyAsync(cprev_seg[j], conv_state, conv_elems * sizeof(bf16),
+                                                      cudaMemcpyDeviceToDevice, ss), "gdn conv carry-in");
                             kernels::launch_prefill_gdn_conv(b8 + po * lqkv, w.ssm_conv, conv_state,
                                 gq + po * lq, gk + po * lq, gv + po * lvdim, plen, c.linear_q_heads, vh,
-                                c.linear_head_dim, c.linear_conv_kernel, eps, st,
-                                part ? cprev : nullptr);
+                                c.linear_head_dim, c.linear_conv_kernel, eps, ss,
+                                part ? cprev_seg[j] : nullptr);
                             kernels::launch_prefill_gdn_scan(gq + po * lq, gk + po * lq, gv + po * lvdim,
                                 la + po * vh, lb + po * vh, w.ssm_dt, w.ssm_a, layer_state,
                                 att + po * lvdim, plen, c.linear_q_heads, vh, c.linear_head_dim,
-                                c.gdn_qh_block, st, /*carry_in=*/part != 0, 0);
+                                c.gdn_qh_block, ss, /*carry_in=*/part != 0, j);
                             if (!part) {
                                 char* host = static_cast<char*>(s.multi_ckpt_host[i]);
                                 pf_cu(cudaMemcpyAsync(host + (size_t)gdn_state_slot(c, L) * state_elems * sizeof(float),
                                                       layer_state, state_elems * sizeof(float),
-                                                      cudaMemcpyDeviceToHost, st), "checkpoint state");
+                                                      cudaMemcpyDeviceToHost, ss), "checkpoint state");
                                 pf_cu(cudaMemcpyAsync(host + s.ckpt_state_bytes + (size_t)L * conv_elems * sizeof(bf16),
                                                       conv_state, conv_elems * sizeof(bf16),
-                                                      cudaMemcpyDeviceToHost, st), "checkpoint conv");
+                                                      cudaMemcpyDeviceToHost, ss), "checkpoint conv");
                             }
                         }
                         continue;
                     }
-                    const int j = i % ns;
-                    cudaStream_t ss = j ? seg_st[j] : st;
                     // A chunk resuming mid-prompt carries its session's conv window and recurrence
                     // in, as a windowed single-prompt pass does -- staged in this stream's own slot.
                     const bool carry = s.multi_pos0 && s.multi_pos0[i] > 0;

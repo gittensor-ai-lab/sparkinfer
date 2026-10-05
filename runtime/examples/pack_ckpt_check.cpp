@@ -11,12 +11,15 @@
 // kernels may land on slightly different numbers; the check fails only on a wrong layout -- a
 // snapshot that is not close, or a missing one.
 //
-// usage: pack_ckpt_check <model_dir> <ids_file>
+// usage: pack_ckpt_check <model_dir or .gguf> <ids_file>
 #include "sparkinfer/runtime.h"
 #include "sparkinfer/kv_cache.h"
 #include "sparkinfer/models/qwen35.h"
 #include "sparkinfer/moe/engine.h"
 #include "qwen38_hf_config.h"
+#include "sparkinfer/gguf.h"
+#include "qwen3_gguf_config.h"
+#include "qwen_checkpoint.h"
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cmath>
@@ -46,9 +49,13 @@ int main(int argc, char** argv) {
     int ckpt[3];
     for (int i = 0; i < 3; i++) ckpt[i] = ((lens[i] - 24) / 16) * 16;   // block-aligned, >= 16 before the end
 
+    // Any checkpoint qwen3_gguf_bench opens: a compressed-tensors directory or a GGUF (an MoE pack,
+    // Qwen3.6-35B-A3B, takes the same path).
     sparkinfer::Qwen35Config cfg;
+    sparkinfer::GGUF g;
+    QwenCheckpointKind kind{};
     std::string err;
-    if (!qwen38_config_from_hf_json(model_dir, cfg, err)) { printf("[FAIL] config: %s\n", err.c_str()); return 1; }
+    if (!qwen_checkpoint_open(model_dir, cfg, g, kind, err)) { printf("[FAIL] open: %s\n", err.c_str()); return 1; }
     cfg.max_seq = 1200;
 
     auto rt = sparkinfer::Runtime::create({});
@@ -72,7 +79,7 @@ int main(int argc, char** argv) {
     mc.num_layers = cfg.n_layers;
     auto engine = sparkinfer::moe::MoEEngine::create(mc);
     sparkinfer::Qwen35Model model(cfg, &kv, engine.get());
-    if (!model.load_compressed_tensors(model_dir)) { printf("[FAIL] load_compressed_tensors\n"); return 1; }
+    if (!qwen_checkpoint_load(model, model_dir, kind)) { printf("[FAIL] load %s\n", qwen_checkpoint_kind_label(kind)); return 1; }
 
     using Snap = sparkinfer::Qwen35Model::RecurrentStateSnapshot;
     // alone

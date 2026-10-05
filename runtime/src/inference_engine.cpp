@@ -1136,6 +1136,7 @@ void ContinuousBatchEngine::run_speculative(Job& job) {
 void ContinuousBatchEngine::enable_prefix_cache(const PrefixCache::Limits& limits) {
     std::lock_guard<std::recursive_mutex> device_lock(model_->device_mutex());
     if (!prefix_cache_) prefix_cache_ = std::make_unique<PrefixCache>(kv_, limits);
+    model_->warm_snapshot_pool();   // a burst's checkpoint snapshots must not pin memory mid-step
 }
 
 void ContinuousBatchEngine::disable_prefix_cache() {
@@ -2160,6 +2161,13 @@ int ContinuousBatchEngine::pack_checkpoint(const Job& j) const {
         ++count;
     }
     if (count == 0) return 0;
+    // A checkpoint under 16 tokens from the prompt's end -- a chat prompt's last turn boundary is
+    // usually ~12 tokens before it -- is taken a block earlier instead of sending the prompt down
+    // the one-prompt path: the next turn still matches the cached prefix up to it and recomputes
+    // one more block, where refusing kept every prompt of a burst out of the pack (Qwen3.6, 32
+    // concurrent 1K-token chat prompts: 19 against 33 requests/s packed).
+    const int bs = kv_->block_size();
+    while (n - row < 16 && row - bs >= 16) row -= bs;
     if (count > 1 || row < 16 || n - row < 16) return -1;
     return row;
 }
