@@ -4019,8 +4019,13 @@ void launch_moe_expert_ffn_q4k(
         else
             launch_pdl_kernel(q_pdl, dim3((nqb + (qthreads >> 5) - 1) / (qthreads >> 5)), dim3(qthreads), 0, stream,
                 quant_h_q8_1_kernel, h_scratch, hq8, nqb, q_pdl);
-        // Qwen3.6's routed down refit to Q4_K: by expert over the gate/up's sort, as the Q5_K one.
-        if (moe_slot && !ar_exact_splitk && top_k == 8 && hidden == 2048 && ffn == 512 &&
+        // Qwen3.6's routed down refit to Q4_K: by expert over the gate/up's sort, as the Q5_K one
+        // (and off with it: SPARKINFER_MOE_DOWN_GROUP=0).
+        static const bool q4_group = [] {
+            const char* e = getenv("SPARKINFER_MOE_DOWN_GROUP");
+            return !(e && e[0] == '0');
+        }();
+        if (q4_group && moe_slot && !ar_exact_splitk && top_k == 8 && hidden == 2048 && ffn == 512 &&
             num_tokens * top_k <= SI_MOE_PERM_MAX) {
             constexpr int R = 4, W = 4;
             const int n_pairs = num_tokens * top_k;
