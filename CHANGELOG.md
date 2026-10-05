@@ -20,6 +20,8 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
   978 -> 912 ms at c16. Output bit-identical for the gate / up (int32 accumulation, same int8
   bytes); the scattered down sums the same products in atomic order as before. New GPU test
   `moe_qi8_k32_gpu_test`. `SPARKINFER_PREFILL_MOE_K32=0` restores the previous kernel.
+  With it, 128-row tiles win from 2048 tokens instead of 3072 (prefill at 3072 tokens 30.3K ->
+  34.5K tok/s); `SPARKINFER_PREFILL_MOE_BM64_MAX` moves that crossover.
 
 ## [0.6.23] — 2026-10-05
 

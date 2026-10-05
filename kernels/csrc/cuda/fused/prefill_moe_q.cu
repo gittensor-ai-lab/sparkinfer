@@ -2151,6 +2151,8 @@ static bool qm_tall_on() {
 // per-row scales come from the same load-time precompute (launch_gguf_dequant_rows_i8 decodes Q6_K),
 // so the fused GEMM produces the materialize path's int8 bytes exactly.
 // SPARKINFER_PFM_Q6K=0 sends Q6_K experts back to the materialize path (A/B).
+bool pfm_moe_gemm_qi8_k32_enabled() { return qm_moe_k32(); }
+
 bool pfm_moe_gemm_qi8_supported(int ggml_type) {
     static const bool q6k = [] {
         const char* e = getenv("SPARKINFER_PFM_Q6K");

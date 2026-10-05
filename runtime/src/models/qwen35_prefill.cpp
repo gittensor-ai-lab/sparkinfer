@@ -1720,8 +1720,18 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         }
         // With the fused GEMM covering every weight, the tile height follows the pairs per expert
         // (N * top_k / E: 16 at 512 tokens on Qwen3.6): 32-row tiles up to 512 tokens, 64-row up to
-        // 3072 (measured crossover against the 128-row kernel), 128 beyond.
-        if (moe_bm32_ok && N <= 3072) return (N <= 512) ? 32 : 64;
+        // the measured crossover against the 128-row kernel, 128 beyond. The pipelined m16n8k32
+        // 128-row kernel (kernels::pfm_moe_gemm_qi8_k32_enabled) moved that crossover from 3072
+        // to 2048: prefill at 3072 tokens 30.3K -> 31.9K tok/s on 128-row tiles, even at 2048,
+        // 8% behind at 1024.
+        // SPARKINFER_PREFILL_MOE_BM64_MAX moves it.
+        static const int bm64_env = [] {
+            const char* e = getenv("SPARKINFER_PREFILL_MOE_BM64_MAX");
+            return e ? atoi(e) : -1;
+        }();
+        const int bm64_max = bm64_env >= 0 ? bm64_env
+                                           : (kernels::pfm_moe_gemm_qi8_k32_enabled() ? 2048 : 3072);
+        if (moe_bm32_ok && N <= bm64_max) return (N <= 512) ? 32 : 64;
         return (N <= 512) ? 16 : 128;
     }();
     const int max_tiles = moe ? (P + moe_bm - 1) / moe_bm + E : 0;

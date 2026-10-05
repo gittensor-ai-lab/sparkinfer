@@ -35,6 +35,10 @@ bool launch_pfm_moe_gemm_qi8(int ggml_type, const signed char* A_i8, const float
 
 // True when launch_pfm_moe_gemm_qi8 has a decode for this ggml_type.
 bool pfm_moe_gemm_qi8_supported(int ggml_type);
+// True when the BM=128 launch runs the pipelined m16n8k32 kernel (SPARKINFER_PREFILL_MOE_K32,
+// default on). Callers choosing between 64- and 128-row tiles use it: that kernel moves the
+// crossover from ~3072 to ~2048 tokens.
+bool pfm_moe_gemm_qi8_k32_enabled();
 
 // Dense fused-decode GEMM only: Q4_K / Q5_K / Q6_K (the routed predicate above stays Q4_K/Q5_K).
 bool pf_dense_gemm_qi8_supported(int ggml_type);
