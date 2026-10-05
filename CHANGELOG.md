@@ -7,7 +7,7 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ### Fixed
 
-- **A request with `ignore_eos` speculates.** Since 0.6.13 (#1265) `spec_eligible` refused it,
+- **A request with `ignore_eos` speculates.** Since 0.6.8 (#1265) `spec_eligible` refused it,
   because the speculative paths only knew the process-wide `SPARKINFER_BENCH_IGNORE_EOS`. Every
   fixed-length benchmark sets `ignore_eos` (AIPerf, vLLM's and SGLang's bench tools), so a server
   with a draft loaded decoded those requests token by token, while vLLM speculates through them.
