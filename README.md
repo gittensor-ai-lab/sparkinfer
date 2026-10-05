@@ -191,6 +191,12 @@ draft:
 | **sparkinfer, T=1.0** | **215** | **402** | **675** | **1,011** |
 | vLLM + DFlash2, T=0.7 | 191 | 276 | 341 | 345 |
 
+Through AIPerf (streaming chat 1024 / 256 with `ignore_eos`, T=0.7, top_k 20, top_p 0.95), 0.6.30
+against vLLM 0.30.0 with the same draft, output tok/s at 1 / 2 / 4 / 8 requests: **227 / 385 / 578 /
+785** vs 196 / 313 / 381 / 426; on ShareGPT prompts **193 / 354 / 581 / 533** vs 163 / 237 / 338 /
+346. Before 0.6.30 a request with `ignore_eos` never speculated, so fixed-length benchmarks of a
+server with a draft measured plain decode (96 / 183 / 321 / 554).
+
 A request speculating alone is bit-identical to speculation off; a group uses batch arithmetic,
 as packed decode does.
 

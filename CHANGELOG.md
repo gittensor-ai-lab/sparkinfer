@@ -5,6 +5,12 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+## [0.6.30] — 2026-10-06
+
+**Speculative decoding now runs in fixed-length benchmarks: a request with `ignore_eos` speculates.
+Through AIPerf with the DFlash2 draft, 1 / 4 / 8 requests run 227 / 578 / 785 tok/s, against
+196 / 381 / 426 for vLLM 0.30.0 with the same draft.**
+
 ### Fixed
 
 - **A request with `ignore_eos` speculates.** Since 0.6.8 (#1265) `spec_eligible` refused it,
