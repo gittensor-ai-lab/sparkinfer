@@ -1081,7 +1081,12 @@ __global__ __launch_bounds__(256, 2) void pfm_moe_gemm_qi8_k32_kernel(
     const int nsb = K >> 8;
 
     __shared__ __align__(16) signed char Bs[2][QM_BN][QM_LD];
-    __shared__ __align__(16) signed char As[2][BMT][QM_BK];
+    // A ring: NA K-steps of the activation tile in flight. With two buffers only the next step was
+    // ever in flight, and a step's MMAs are too short to cover its L2 fetch -- at K=512 (the down)
+    // that wait came sixteen times a tile. Three planes at 128 rows, four at 64 (48 KB of static
+    // shared memory is the cap either way).
+    constexpr int NA = BMT == 128 ? 3 : 4;
+    __shared__ __align__(16) signed char As[NA][BMT][QM_BK];
     __shared__ int s_tok[BMT];
 
     const int tid = threadIdx.x;
@@ -1131,8 +1136,13 @@ __global__ __launch_bounds__(256, 2) void pfm_moe_gemm_qi8_k32_kernel(
     const unsigned b_sm = (unsigned)__cvta_generic_to_shared(
         &Bs[0][wn * WC + ((lane >> 4) & 1) * 8 + (lane & 7)][16 * ((lane >> 3) & 1)]);
 
-    stageA(0, 0);
-    int abuf = 0, bbuf = 0;
+    const int nks = K / QM_BK;                           // K steps
+#pragma unroll
+    for (int s0 = 0; s0 < NA - 1; s0++) {               // prologue: the first NA-1 steps in flight
+        if (s0 < nks) stageA(s0, s0 * QM_BK);
+        else          __pipeline_commit();
+    }
+    int bbuf = 0, kstep = 0;
     QmStage<QT> stg;
     QmQ5kRaw st5;     // Q5_K's register stage (QmStage only carries a pointer for it)
     auto fetch = [&](const unsigned char* blk) {
@@ -1158,12 +1168,16 @@ __global__ __launch_bounds__(256, 2) void pfm_moe_gemm_qi8_k32_kernel(
         __syncthreads();      // Bs[bbuf] decoded; the MMA that read Bs[bbuf ^ 1] is done
         const bool more = (sb + 1) < nsb;
         if (more && drow_ok) fetch(drow + (size_t)(sb + 1) * BS);
-        for (int kk = 0; kk < QM_SB; kk += QM_BK) {
-            const int knext = sb * QM_SB + kk + QM_BK;
-            if (knext < K) stageA(abuf ^ 1, knext);
-            __pipeline_wait_prior(knext < K ? 1 : 0);
+        for (int kk = 0; kk < QM_SB; kk += QM_BK, kstep++) {
+            // Issue step kstep+NA-1 into the slot step kstep-1 used (its readers are past the
+            // barrier that closed the previous step), then wait for step kstep itself. Every
+            // thread commits one group per step -- empty past the end -- so the count is uniform.
+            const int kfut = kstep + NA - 1;
+            if (kfut < nks) stageA(kfut % NA, kfut * QM_BK);
+            else            __pipeline_commit();
+            __pipeline_wait_prior(NA - 1);
             __syncthreads();
-            const unsigned ab = a_sm + (unsigned)abuf * (BMT * QM_BK);
+            const unsigned ab = a_sm + (unsigned)(kstep % NA) * (BMT * QM_BK);
             unsigned af32[2][4];
 #pragma unroll
             for (int i = 0; i < 2; i++) qm_ldsm_x4(af32[i], ab + (unsigned)(i * 16 * QM_BK));
@@ -1178,7 +1192,6 @@ __global__ __launch_bounds__(256, 2) void pfm_moe_gemm_qi8_k32_kernel(
                 }
             }
             __syncthreads();
-            abuf ^= 1;
         }
         if (more && drow_ok) decode(&Bs[bbuf ^ 1][dr][0]);
         bbuf ^= 1;
