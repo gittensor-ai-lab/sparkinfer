@@ -64,6 +64,7 @@
 #include <mma.h>
 
 #include <atomic>
+#include <type_traits>
 #include <cstdio>
 #include <cstdlib>
 
@@ -798,6 +799,300 @@ void pf_gdnc_scan_kernel(const __nv_bfloat16* __restrict__ q,
     }
 }
 
+// ---------------------------------------------------------------------------
+// Kernel 2b: the same scan with each warp's state columns held in registers.
+//
+// pf_gdnc_scan_kernel spends ~4.6 us a chunk (Qwen3.8 at 8K: 256 chunks, ~1.2 ms a layer) for
+// ~0.4 M multiply-adds a block: seven block barriers and three smem round trips (wmma stores, the
+// fp32 S carrier, the bf16 mirrors) sit on the serial chain, not the arithmetic.
+//
+// Every state column's chain is independent (see STRUCTURE above), so a warp can own columns
+// outright. Here a warp owns 16 and holds them as S^T [16 cols][HD rows] in m16n8 fp32
+// accumulators, and every product of the chunk body runs on registers:
+//   U^T = U0^T - S^T W^T      A = bf16(S^T), straight from the accumulators (the FlashAttention
+//   Y0^T = S^T Q^T            P-reuse layout); B = W^ / Q rows by ldmatrix
+//   Y^T = exp(G) Y0^T + U^T M^T   A = U^T as hi + lo bf16 pairs and B = M as hi + lo pairs (three
+//                             products), so M U keeps ~16 mantissa bits like the fp32 loop it
+//                             replaces
+//   S^T = exp(G_last) S^T + U~^T K   A = bf16(U~^T) (the same narrowing the block form makes);
+//                             B = K rows by ldmatrix.trans
+// The block shares only the chunk's W^ / Q / K / M / U0 / gates, staged by cp.async one chunk
+// ahead into a second buffer, so a chunk costs ONE block barrier. Not bit-identical to the block
+// form: S is scaled by exp(G_last) before the K^T U~ products accumulate into it rather than after,
+// and M U sums in a different order. SPARKINFER_PREFILL_GDN_SCAN_MMA=0 restores the block form.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ uint32_t gm_pack(float lo, float hi) {
+    const __nv_bfloat162 v = __floats2bfloat162_rn(lo, hi);
+    return *reinterpret_cast<const uint32_t*>(&v);
+}
+// hi = bf16(x), lo = bf16(x - hi): hi + lo carries ~16 mantissa bits.
+__device__ __forceinline__ void gm_split(float x0, float x1, uint32_t& hi, uint32_t& lo) {
+    const __nv_bfloat162 h = __floats2bfloat162_rn(x0, x1);
+    const __nv_bfloat162 l = __floats2bfloat162_rn(x0 - __low2float(h), x1 - __high2float(h));
+    hi = *reinterpret_cast<const uint32_t*>(&h);
+    lo = *reinterpret_cast<const uint32_t*>(&l);
+}
+__device__ __forceinline__ void gm_mma(float c[4], const uint32_t a[4], uint32_t b0, uint32_t b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ void gm_ldsm4(uint32_t r[4], const void* p) {
+    const unsigned a = (unsigned)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+}
+__device__ __forceinline__ void gm_ldsm4_t(uint32_t r[4], const void* p) {
+    const unsigned a = (unsigned)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(a));
+}
+
+template <int WPC>
+struct GmLayout {
+    static constexpr int C = 32, HD = 128, CW = 16, NCOL = WPC * CW;
+    static constexpr int RS = HD + 8;       // W / Q / K row stride (bf16): conflict-free ldmatrix
+    static constexpr int MS = C + 8;        // M row stride (fp32): conflict-free float2 reads
+    static constexpr int US = NCOL + 8;     // U0 row stride (bf16)
+    static constexpr int YS = CW + 8;       // per-warp Y staging row stride (bf16)
+    static constexpr int OFF_Q = C * RS * 2, OFF_K = 2 * C * RS * 2, OFF_M = 3 * C * RS * 2;
+    static constexpr int OFF_U = OFF_M + C * MS * 4, OFF_G = OFF_U + C * US * 2;
+    static constexpr int STAGE = OFF_G + C * 4;
+    static constexpr int SMEM = 2 * STAGE + WPC * C * YS * 2;
+    static_assert(STAGE % 16 == 0 && OFF_M % 16 == 0 && OFF_U % 16 == 0 && OFF_G % 16 == 0, "16B");
+};
+
+template <int WPC>
+__global__ __launch_bounds__(WPC * 32, 1)
+void pf_gdnc_scan_mma_kernel(const __nv_bfloat16* __restrict__ q,
+                             const __nv_bfloat16* __restrict__ k,
+                             const float* __restrict__ g_buf,
+                             const __nv_bfloat16* __restrict__ w_buf,
+                             const __nv_bfloat16* __restrict__ u_buf,
+                             const float* __restrict__ m_buf,
+                             float* __restrict__ state,
+                             __nv_bfloat16* __restrict__ out,
+                             int n_tokens, int q_heads, int v_heads, int n_chunks,
+                             bool qh_block, int carry) {
+    using L = GmLayout<WPC>;
+    constexpr int C = L::C, HD = L::HD, CW = L::CW, NCOL = L::NCOL;
+    constexpr int NTHR = WPC * 32;
+    extern __shared__ __align__(16) char s_raw[];
+
+    const int h = blockIdx.x;
+    const int j0 = blockIdx.y * NCOL;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int g8 = lane >> 2, q4 = lane & 3;
+    const int jw = warp * CW;               // the warp's first column inside the block
+    const int jg = j0 + jw;                 // ... and inside the head
+    const int qh = qh_block ? (h / (v_heads / q_heads)) : (h % q_heads);
+    const int q_dim = q_heads * HD;
+    const int v_dim = v_heads * HD;
+    const float scale = rsqrtf((float)HD);
+
+    // S^T: rows = the warp's 16 columns, cols = HD state rows; tile n covers rows 8n..8n+7.
+    float S[HD / 8][4];
+    {
+        const float* s0 = state + ((size_t)h * HD + jg + g8) * HD;
+        const float* s1 = s0 + (size_t)8 * HD;
+        #pragma unroll
+        for (int n = 0; n < HD / 8; n++) {
+            const int m = 8 * n + 2 * q4;
+            const float2 a = carry ? *reinterpret_cast<const float2*>(s0 + m) : make_float2(0.f, 0.f);
+            const float2 b = carry ? *reinterpret_cast<const float2*>(s1 + m) : make_float2(0.f, 0.f);
+            S[n][0] = a.x; S[n][1] = a.y; S[n][2] = b.x; S[n][3] = b.y;
+        }
+    }
+
+    // Stage chunk c2 into buffer c2 & 1. Rows past n_tokens are zero-filled (no read), which makes
+    // W^, U0, Q and K vanish there exactly as the prep kernel's tail rows do.
+    auto stage = [&](int c2) {
+        char* sb = s_raw + (c2 & 1) * L::STAGE;
+        const int t0s = c2 * C;
+        const int lens = min(C, n_tokens - t0s);
+        constexpr int R8 = HD / 8;                       // 16-byte pieces a row
+        for (int e = tid; e < 3 * C * R8; e += NTHR) {
+            const int which = e / (C * R8), r = e - which * (C * R8);
+            const int i = r / R8, d = (r - i * R8) * 8;
+            const bool live = i < lens;
+            const int ti = t0s + (live ? i : 0);
+            const __nv_bfloat16* src =
+                which == 0 ? w_buf + ((size_t)ti * v_heads + h) * HD + d
+              : which == 1 ? q + (size_t)ti * q_dim + qh * HD + d
+                           : k + (size_t)ti * q_dim + qh * HD + d;
+            __pipeline_memcpy_async(sb + which * L::OFF_Q + (i * L::RS + d) * 2, src, 16, live ? 0 : 16);
+        }
+        const float* msrc = m_buf + ((size_t)c2 * v_heads + h) * C * C;   // whole chunk: always allocated
+        for (int e = tid; e < C * C / 4; e += NTHR) {
+            const int i = e / (C / 4), p = (e - i * (C / 4)) * 4;
+            __pipeline_memcpy_async(sb + L::OFF_M + (i * L::MS + p) * 4, msrc + i * C + p, 16);
+        }
+        for (int e = tid; e < C * NCOL / 8; e += NTHR) {
+            const int i = e / (NCOL / 8), jj = (e - i * (NCOL / 8)) * 8;
+            const bool live = i < lens;
+            const int ti = t0s + (live ? i : 0);
+            __pipeline_memcpy_async(sb + L::OFF_U + (i * L::US + jj) * 2,
+                                    u_buf + ((size_t)ti * v_heads + h) * HD + j0 + jj, 16, live ? 0 : 16);
+        }
+        if (tid < C) {
+            const bool live = tid < lens;
+            const int ti = t0s + (live ? tid : 0);
+            __pipeline_memcpy_async(sb + L::OFF_G + tid * 4, g_buf + (size_t)ti * v_heads + h, 4,
+                                    live ? 0 : 4);
+        }
+        __pipeline_commit();
+    };
+    if (n_chunks > 0) stage(0);
+
+    __nv_bfloat16* sY = reinterpret_cast<__nv_bfloat16*>(s_raw + 2 * L::STAGE) + warp * C * L::YS;
+
+    for (int c = 0; c < n_chunks; c++) {
+        __pipeline_wait_prior(0);
+        __syncthreads();                 // chunk c landed; every warp is past chunk c-1's buffer
+        if (c + 1 < n_chunks) stage(c + 1);
+
+        const char* sb = s_raw + (c & 1) * L::STAGE;
+        const __nv_bfloat16* sW = reinterpret_cast<const __nv_bfloat16*>(sb);
+        const __nv_bfloat16* sQ = reinterpret_cast<const __nv_bfloat16*>(sb + L::OFF_Q);
+        const __nv_bfloat16* sK = reinterpret_cast<const __nv_bfloat16*>(sb + L::OFF_K);
+        const float* sM = reinterpret_cast<const float*>(sb + L::OFF_M);
+        const __nv_bfloat16* sU = reinterpret_cast<const __nv_bfloat16*>(sb + L::OFF_U);
+        const float* sG = reinterpret_cast<const float*>(sb + L::OFF_G);
+        const int t0 = c * C;
+        const int len = min(C, n_tokens - t0);
+
+        // ---- P = S^T [W^ ; Q]^T: k over HD, n over the chunk's 32 tokens (4 tiles each) ----
+        float Pu[4][4], Py[4][4];
+        #pragma unroll
+        for (int n = 0; n < 4; n++)
+            #pragma unroll
+            for (int e = 0; e < 4; e++) { Pu[n][e] = 0.f; Py[n][e] = 0.f; }
+        #pragma unroll
+        for (int s = 0; s < HD / 16; s++) {
+            uint32_t a[4];
+            a[0] = gm_pack(S[2 * s][0], S[2 * s][1]);
+            a[1] = gm_pack(S[2 * s][2], S[2 * s][3]);
+            a[2] = gm_pack(S[2 * s + 1][0], S[2 * s + 1][1]);
+            a[3] = gm_pack(S[2 * s + 1][2], S[2 * s + 1][3]);
+            const int mat = lane >> 3, row = lane & 7;
+            #pragma unroll
+            for (int n = 0; n < 4; n += 2) {
+                const int t = 8 * (n + (mat >> 1)) + row;
+                const int d = 16 * s + 8 * (mat & 1);
+                uint32_t bw[4], bq[4];
+                gm_ldsm4(bw, sW + t * L::RS + d);
+                gm_ldsm4(bq, sQ + t * L::RS + d);
+                gm_mma(Pu[n], a, bw[0], bw[1]);
+                gm_mma(Pu[n + 1], a, bw[2], bw[3]);
+                gm_mma(Py[n], a, bq[0], bq[1]);
+                gm_mma(Py[n + 1], a, bq[2], bq[3]);
+            }
+        }
+
+        // ---- U^T = U0^T - P_u, in the accumulator layout (row j, col t = 8n + 2q4 + {0,1}) ----
+        float U[4][4];
+        #pragma unroll
+        for (int n = 0; n < 4; n++) {
+            const int t = 8 * n + 2 * q4;
+            U[n][0] = __bfloat162float(sU[t * L::US + jw + g8]) - Pu[n][0];
+            U[n][1] = __bfloat162float(sU[(t + 1) * L::US + jw + g8]) - Pu[n][1];
+            U[n][2] = __bfloat162float(sU[t * L::US + jw + g8 + 8]) - Pu[n][2];
+            U[n][3] = __bfloat162float(sU[(t + 1) * L::US + jw + g8 + 8]) - Pu[n][3];
+        }
+
+        // ---- Y^T = exp(G) Y0^T + U^T M^T (M lower-triangular, zeros above) ----
+        float Y[4][4];
+        #pragma unroll
+        for (int n = 0; n < 4; n++)
+            #pragma unroll
+            for (int e = 0; e < 4; e++) Y[n][e] = 0.f;
+        #pragma unroll
+        for (int s = 0; s < 2; s++) {
+            uint32_t ah[4], al[4];
+            gm_split(U[2 * s][0], U[2 * s][1], ah[0], al[0]);
+            gm_split(U[2 * s][2], U[2 * s][3], ah[1], al[1]);
+            gm_split(U[2 * s + 1][0], U[2 * s + 1][1], ah[2], al[2]);
+            gm_split(U[2 * s + 1][2], U[2 * s + 1][3], ah[3], al[3]);
+            #pragma unroll
+            for (int n = 0; n < 4; n++) {
+                const float* mr = sM + (8 * n + g8) * L::MS + 16 * s + 2 * q4;
+                const float2 m0 = *reinterpret_cast<const float2*>(mr);
+                const float2 m1 = *reinterpret_cast<const float2*>(mr + 8);
+                uint32_t bh0, bl0, bh1, bl1;
+                gm_split(m0.x, m0.y, bh0, bl0);
+                gm_split(m1.x, m1.y, bh1, bl1);
+                gm_mma(Y[n], ah, bh0, bh1);
+                gm_mma(Y[n], al, bh0, bh1);
+                gm_mma(Y[n], ah, bl0, bl1);
+            }
+        }
+        float eg[8], eg2[8];
+        const float g_last = sG[len - 1];
+        #pragma unroll
+        for (int n = 0; n < 4; n++)
+            #pragma unroll
+            for (int e = 0; e < 2; e++) {
+                const float gt = sG[8 * n + 2 * q4 + e];
+                eg[2 * n + e] = __expf(gt);
+                eg2[2 * n + e] = __expf(g_last - gt);
+            }
+        #pragma unroll
+        for (int n = 0; n < 4; n++) {
+            const int t = 8 * n + 2 * q4;
+            sY[t * L::YS + g8]           = __float2bfloat16((eg[2 * n] * Py[n][0] + Y[n][0]) * scale);
+            sY[(t + 1) * L::YS + g8]     = __float2bfloat16((eg[2 * n + 1] * Py[n][1] + Y[n][1]) * scale);
+            sY[t * L::YS + g8 + 8]       = __float2bfloat16((eg[2 * n] * Py[n][2] + Y[n][2]) * scale);
+            sY[(t + 1) * L::YS + g8 + 8] = __float2bfloat16((eg[2 * n + 1] * Py[n][3] + Y[n][3]) * scale);
+        }
+        __syncwarp();
+        if (lane < len) {
+            const uint4* src = reinterpret_cast<const uint4*>(sY + lane * L::YS);
+            uint4* dst = reinterpret_cast<uint4*>(out + (size_t)(t0 + lane) * v_dim + h * HD + jg);
+            dst[0] = src[0];
+            dst[1] = src[1];
+        }
+
+        // ---- S^T = exp(G_last) S^T + U~^T K, U~ = exp(G_last - G) U^ narrowed to bf16 ----
+        uint32_t ua[2][4];
+        #pragma unroll
+        for (int s = 0; s < 2; s++) {
+            const int n0 = 2 * s, n1 = 2 * s + 1;
+            ua[s][0] = gm_pack(eg2[2 * n0] * U[n0][0], eg2[2 * n0 + 1] * U[n0][1]);
+            ua[s][1] = gm_pack(eg2[2 * n0] * U[n0][2], eg2[2 * n0 + 1] * U[n0][3]);
+            ua[s][2] = gm_pack(eg2[2 * n1] * U[n1][0], eg2[2 * n1 + 1] * U[n1][1]);
+            ua[s][3] = gm_pack(eg2[2 * n1] * U[n1][2], eg2[2 * n1 + 1] * U[n1][3]);
+        }
+        const float gl = __expf(g_last);
+        {
+            const int mat = lane >> 3, row = lane & 7;
+            #pragma unroll
+            for (int n = 0; n < HD / 8; n++) {
+                #pragma unroll
+                for (int e = 0; e < 4; e++) S[n][e] *= gl;
+                // matrices: (tokens 0-7, 8-15, 16-23, 24-31) x state rows 8n..8n+7
+                uint32_t b[4];
+                gm_ldsm4_t(b, sK + (8 * mat + row) * L::RS + 8 * n);
+                gm_mma(S[n], ua[0], b[0], b[1]);
+                gm_mma(S[n], ua[1], b[2], b[3]);
+            }
+        }
+        __syncwarp();                    // sY is rewritten next chunk
+    }
+
+    {
+        float* s0 = state + ((size_t)h * HD + jg + g8) * HD;
+        float* s1 = s0 + (size_t)8 * HD;
+        #pragma unroll
+        for (int n = 0; n < HD / 8; n++) {
+            const int m = 8 * n + 2 * q4;
+            *reinterpret_cast<float2*>(s0 + m) = make_float2(S[n][0], S[n][1]);
+            *reinterpret_cast<float2*>(s1 + m) = make_float2(S[n][2], S[n][3]);
+        }
+    }
+}
+
 // Workspace cache. The scan is called once per linear layer with the same N, so one allocation is
 // reused across all 24 layers and every subsequent prefill; it only ever grows. One per slot, so
 // scans issued on different streams at once (a prompt pack's segments) each have their own.
@@ -884,6 +1179,21 @@ bool gdnc_scan_smem_ok(int dev) {
             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm);
         if (ce != cudaSuccess) cudaGetLastError();
         cfg[dev] = (ce == cudaSuccess || sm <= 48u * 1024u) ? 1 : 2;
+    }
+    return cfg[dev] == 1;
+}
+
+template <int WPC>
+bool gdnc_scan_mma_smem_ok(int dev) {
+    constexpr int kMaxDevices = 16;
+    static int cfg[kMaxDevices] = {0};
+    if (dev < 0 || dev >= kMaxDevices) return false;
+    if (!cfg[dev]) {
+        const cudaError_t ce = cudaFuncSetAttribute(pf_gdnc_scan_mma_kernel<WPC>,
+                                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                    GmLayout<WPC>::SMEM);
+        if (ce != cudaSuccess) cudaGetLastError();
+        cfg[dev] = ce == cudaSuccess ? 1 : 2;
     }
     return cfg[dev] == 1;
 }
@@ -1014,6 +1324,17 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
     const bool use_thin = thin_on && !use_regs && !use_big && sms > 0 &&
                           v_heads * (HD / JC_S) < sms && gdnc_scan_smem_ok<C, HD, JC_T>(dev);
 
+    // Register-resident warp scan (pf_gdnc_scan_mma_kernel): the value is the warps a block (2, 4
+    // or 8; 16 state columns each), 0 restores the block-form shapes above.
+    static const int mma_wpc = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_GDN_SCAN_MMA");
+        const int v = e ? atoi(e) : 4;
+        return (v == 2 || v == 4 || v == 8) ? v : 0;
+    }();
+    const bool use_mma = mma_wpc == 2 ? gdnc_scan_mma_smem_ok<2>(dev)
+                       : mma_wpc == 4 ? gdnc_scan_mma_smem_ok<4>(dev)
+                       : mma_wpc == 8 ? gdnc_scan_mma_smem_ok<8>(dev) : false;
+
     auto db = reinterpret_cast<const __nv_bfloat16*>(dt);
     auto aa = reinterpret_cast<const __nv_bfloat16*>(a);
 
@@ -1051,7 +1372,18 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
         pf_gdnc_prep_kernel<C, HD><<<gprep, PREP_THREADS, sm_prep, stream>>>(
             qb, kb, vb, ab, bb, db, aa, g_buf, w_buf, u_buf, m_buf,
             len, q_heads, v_heads, qh_block, prep_warp_inv);
-        if (use_regs) {
+        if (use_mma) {
+            auto go = [&](auto wpc_tag) {
+                constexpr int W = decltype(wpc_tag)::value;
+                pf_gdnc_scan_mma_kernel<W>
+                    <<<dim3(v_heads, HD / GmLayout<W>::NCOL), W * 32, GmLayout<W>::SMEM, stream>>>(
+                        qb, kb, g_buf, w_buf, u_buf, m_buf, state, ob,
+                        len, q_heads, v_heads, n_chunks, qh_block, carry);
+            };
+            if (mma_wpc == 2) go(std::integral_constant<int, 2>{});
+            else if (mma_wpc == 8) go(std::integral_constant<int, 8>{});
+            else go(std::integral_constant<int, 4>{});
+        } else if (use_regs) {
             pf_gdnc_scan_kernel<C, HD, JC_S, true>
                 <<<dim3(v_heads, HD / JC_S), (C * JC_S) / 4,
                    gdnc_scan_smem<C, HD, JC_S, true>(), stream>>>(

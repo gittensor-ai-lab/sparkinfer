@@ -5,6 +5,20 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+### Performance
+
+- **The Gated-DeltaNet prefill scan keeps each warp's state columns in registers**
+  (`pf_gdnc_scan_mma_kernel`). A warp owns 16 columns of S as m16n8 accumulators and runs all four
+  chunk products on `mma.sync` straight from them, so a chunk costs one block barrier (the
+  double-buffered cp.async staging) instead of seven plus three shared-memory round trips. Per
+  layer at 8K tokens, prep + scan: Qwen3.8 (48 v-heads) 1,628 -> 1,008 us, Qwen3.6 (32) 1,177 ->
+  849 us. Prefill 1K / 4K / 8K: Qwen3.6 26.2K / 38.5K / 39.3K -> 27.2K / 40.4K / 41.3K tok/s,
+  Qwen3.8 12.5K / 16.1K / 15.4K -> 13.5K / 17.1K / 16.2K. Not bit-identical (M U runs as hi + lo
+  bf16 products, the S update accumulates into the decayed state); against an fp64 run of the
+  recurrence both forms land at the same distance, and `qwen3_gguf_prefill_check` over four
+  real-text slices is level (KL against the token path 0.0111 -> 0.0118 on Qwen3.6, 0.0108 ->
+  0.0099 on Qwen3.8). `SPARKINFER_PREFILL_GDN_SCAN_MMA=0` restores the block form.
+
 ## [0.6.28] — 2026-10-05
 
 **Qwen3.6 serving at 32 chat requests +5%, now level with vLLM (2,366 tok/s each), with a 45%
