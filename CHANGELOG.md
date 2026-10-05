@@ -5,6 +5,18 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+### Performance
+
+- **A packed batch's row GEMVs run their 8-row chunks as one launch** (bf16 row GEMV and the Q8_0
+  row MMVQ). Each chunk alone launches N / RPB CTAs -- 128 for Qwen3.6's 256-expert router, 512 for
+  its attention k / v -- and at 32 rows four of them ran back to back on the critical path. The
+  chunk index now rides on grid.y; every row computes the same bits (new GPU test
+  `gemv_rows_fuse_gpu_test`). `SPARKINFER_GEMV_ROWS_FUSE=0` restores a launch per chunk.
+- **The grouped MoE gate/up takes an expert's pairs at most four to a warp**, so a popular expert is
+  spread over several warps instead of one warp's serial passes: 97 -> 92 us a layer at c32.
+- Together: Qwen3.6 `cb_bench` c32 ITL 11.61 -> 11.29 ms, c16 7.52 -> 7.44 ms; served chat (AIPerf,
+  distinct prompts) c16 / c32 1,559 / 1,868 -> 1,586 / 1,939 output tok/s. Qwen3.8 unchanged.
+
 ## [0.6.22] — 2026-10-05
 
 **Qwen3.6 serving at 32 concurrent requests +5%: the routed MoE reads each expert's weights about

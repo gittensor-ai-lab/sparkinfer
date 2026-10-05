@@ -264,6 +264,9 @@ __global__ void gemv_bf16_rows_sk_kernel(const __nv_bfloat16* __restrict__ x,
                                          OutT* __restrict__ y, int N, int K) {
     constexpr int RPB = GEMV_WPB / S;
     __shared__ float part[M][RPB][S];
+    // grid.y > 1: one launch of several M-row chunks, chunk blockIdx.y at rows [M * y, M * y + M)
+    x += (size_t)blockIdx.y * M * K;
+    y += (size_t)blockIdx.y * M * N;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int row_local = warp / S, split = warp % S;
     const int n = blockIdx.x * RPB + row_local;
@@ -1938,6 +1941,9 @@ __global__ void si_mmvq_q80_rows_exact_kernel(const si_block_q8_1* __restrict__ 
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, tid = threadIdx.x;
     const int row = blockIdx.x;
     if (row >= N) return;
+    // grid.y > 1: one launch of several MMAX-row chunks (launch_mmvq_q80_rows_chunks)
+    q += (size_t)blockIdx.y * MMAX * NBLOCKS;
+    y += (size_t)blockIdx.y * MMAX * N;
     const unsigned char* w_row = W + (size_t)row * NBLOCKS * 34;
     float tmp[MMAX];
     #pragma unroll
@@ -3096,8 +3102,26 @@ static bool launch_gemv_rows_t(const void* x, const void* W, T* y,
     // of it computes. Declining instead turned away every packed batch of 9+ rows whose bf16
     // projection or MoE router reads this -- Qwen3.6-35B-A3B decoded 16 / 32 concurrent requests
     // one forward each, below a single stream's aggregate (~460 against ~500 tok/s).
+    //
+    // The whole 8-row chunks share one launch, chunk on grid.y. Launched one after another, each
+    // filled only N / RPB CTAs (128 for Qwen3.6's 256-expert router, on 170 SMs), so a 32-row
+    // router was four back-to-back underfilled launches. SPARKINFER_GEMV_ROWS_FUSE=0 restores the
+    // launch per chunk.
     if (M > 8) {
-        for (int r0 = 0; r0 < M; r0 += 8)
+        static const bool fuse = [] {
+            const char* e = getenv("SPARKINFER_GEMV_ROWS_FUSE");
+            return !(e && e[0] == '0');
+        }();
+        const int full = M / 8;
+        int r0 = 0;
+        if (fuse && full > 1) {
+            constexpr int RPB = GEMV_WPB / S;
+            const dim3 grid((N + RPB - 1) / RPB, full);
+            gemv_bf16_rows_sk_kernel<T, S, 8><<<grid, GEMV_WPB * 32, 0, stream>>>(
+                reinterpret_cast<const __nv_bfloat16*>(x), reinterpret_cast<const __nv_bfloat16*>(W), y, N, K);
+            r0 = full * 8;
+        }
+        for (; r0 < M; r0 += 8)
             if (!launch_gemv_rows_t<T, S>(static_cast<const __nv_bfloat16*>(x) + (size_t)r0 * K, W,
                                           y + (size_t)r0 * N, M - r0 < 8 ? M - r0 : 8, N, K, stream))
                 return false;
@@ -5524,6 +5548,20 @@ bool launch_mmvq_q80_rows(const void* q81, const void* W, void* y,
 #undef SI_Q80_ROWS
     return true;
 }
+// `chunks` whole 8-row chunks of the Q8_0 rows kernel in one launch, chunk on grid.y; each row's
+// arithmetic is the 8-row launch's. false (nothing launched) for a K it has no body for.
+static bool launch_mmvq_q80_rows_chunks(const void* q81, const void* W, void* y,
+                                        int chunks, int N, int K, cudaStream_t stream) {
+    const auto* q = reinterpret_cast<const si_block_q8_1*>(q81);
+    const auto* w = reinterpret_cast<const unsigned char*>(W);
+    auto* out = reinterpret_cast<__nv_bfloat16*>(y);
+    const dim3 grid(N, chunks);
+    if (K == 512)       si_mmvq_q80_rows_exact_kernel<__nv_bfloat16, 16, 8><<<grid, 4 * 32, 0, stream>>>(q, w, out, 8, N);
+    else if (K == 2048) si_mmvq_q80_rows_exact_kernel<__nv_bfloat16, 64, 8><<<grid, 4 * 32, 0, stream>>>(q, w, out, 8, N);
+    else if (K == 4096) si_mmvq_q80_rows_exact_kernel<__nv_bfloat16, 128, 8><<<grid, 4 * 32, 0, stream>>>(q, w, out, 8, N);
+    else return false;
+    return true;
+}
 bool launch_mmvq_rows(int qtype, const void* q81, const void* W, void* y,
                       int M, int N, int K, cudaStream_t stream, int mma_min_rows) {
     // Every rows kernel below carries exact, compile-time-bounded row bodies only to M=8, so a
@@ -5588,7 +5626,17 @@ bool launch_mmvq_rows(int qtype, const void* q81, const void* W, void* y,
         }
     }
     if (M > 8) {
-        for (int r0 = 0; r0 < M; r0 += 8) {
+        // Q8_0: the whole 8-row chunks in one launch (each chunk alone is N CTAs -- 512 for
+        // Qwen3.6's k / v -- and four of them ran back to back at 32 rows).
+        // SPARKINFER_GEMV_ROWS_FUSE=0 launches every chunk on its own.
+        static const bool fuse = [] {
+            const char* e = getenv("SPARKINFER_GEMV_ROWS_FUSE");
+            return !(e && e[0] == '0');
+        }();
+        int r_done = 0;
+        if (fuse && qtype == 8 && M / 8 > 1 && launch_mmvq_q80_rows_chunks(q81, W, y, M / 8, N, K, stream))
+            r_done = (M / 8) * 8;
+        for (int r0 = r_done; r0 < M; r0 += 8) {
             const int m = (M - r0) < 8 ? (M - r0) : 8;
             if (!launch_mmvq_rows(qtype,
                                   reinterpret_cast<const si_block_q8_1*>(q81)

@@ -1422,10 +1422,15 @@ __device__ __forceinline__ float si_vec_dot_q4_K_wa(const si_q4k_wdec& w, const 
 // changes only when each weight row is read: the pairs that share an expert run back to back and
 // its rows are still in L2 for the second one, instead of coming from DRAM once per pair.
 constexpr int SI_MOE_PERM_MAX = 1024;
+// The grouped gate/up takes an expert's pairs at most this many to a warp, so a popular expert is
+// spread over several warps rather than one warp's serial passes (gate/up 97 -> 91 us a layer at
+// c32); the down keeps whole segments, since its warp holds the weights in registers across pairs.
+constexpr int SI_MOE_CHUNK = 4;
 // One per stream (moe_slot_for), so two streams running a grouped MoE step never share them.
 struct SiMoeSlot {
     int perm[SI_MOE_PERM_MAX];
     int seg[SI_MOE_PERM_MAX + 2];                  // [0..nseg] perm offsets, then nseg itself
+    int segc[SI_MOE_PERM_MAX + 2];                 // the same split into chunks of <= SI_MOE_CHUNK pairs
     float dpart[SI_MOE_PERM_MAX * 2048];           // grouped down: one dot per (pair, hidden row)
 };
 constexpr int SI_MOE_SLOTS = 4;
@@ -1462,12 +1467,14 @@ __device__ __forceinline__ int si_block256_excl_scan(int v, int* wsum, int* tota
     return base;
 }
 // 256 threads, 4 counters each, so expert ids 0..1023. Besides perm it writes the expert segments:
-// seg[0..nseg] are the perm offsets where each routed expert's pairs start (seg[nseg] = n_pairs).
+// seg[0..nseg] are the perm offsets where each routed expert's pairs start (seg[nseg] = n_pairs),
+// and segc[0..nsegc] the same with every segment cut into chunks of at most SI_MOE_CHUNK pairs.
 // An id outside that range (not expected: the arm is gated to Qwen3.6's 256 experts) makes every
 // pair its own segment in token order, which the grouped kernels run exactly as the per-pair ones.
 __global__ void __launch_bounds__(256) moe_pair_sort_kernel(const int* __restrict__ expert_ids, int n_pairs,
                                                            int* __restrict__ perm, int* __restrict__ seg,
-                                                           int* __restrict__ nseg) {
+                                                           int* __restrict__ nseg, int* __restrict__ segc,
+                                                           int* __restrict__ nsegc) {
     constexpr int NE = 1024;
     __shared__ int cnt[NE];
     __shared__ int wsum[8];
@@ -1482,8 +1489,8 @@ __global__ void __launch_bounds__(256) moe_pair_sort_kernel(const int* __restric
     }
     __syncthreads();
     if (out_of_range) {
-        for (int i = t; i < n_pairs; i += 256) { perm[i] = i; seg[i] = i; }
-        if (t == 0) { seg[n_pairs] = n_pairs; *nseg = n_pairs; }
+        for (int i = t; i < n_pairs; i += 256) { perm[i] = i; seg[i] = i; segc[i] = i; }
+        if (t == 0) { seg[n_pairs] = n_pairs; *nseg = n_pairs; segc[n_pairs] = n_pairs; *nsegc = n_pairs; }
         return;
     }
     // thread t owns cnt[4t..4t+3]
@@ -1498,6 +1505,15 @@ __global__ void __launch_bounds__(256) moe_pair_sort_kernel(const int* __restric
     if (c2) seg[k++] = o2;
     if (c3) seg[k++] = o3;
     if (t == 0) { seg[ns] = n_pairs; *nseg = ns; }
+    constexpr int CH = SI_MOE_CHUNK;
+    const int k0 = (c0 + CH - 1) / CH, k1 = (c1 + CH - 1) / CH, k2 = (c2 + CH - 1) / CH, k3 = (c3 + CH - 1) / CH;
+    int nc;
+    k = si_block256_excl_scan(k0 + k1 + k2 + k3, wsum, &nc);
+    for (int q = 0; q < k0; ++q) segc[k++] = o0 + q * CH;
+    for (int q = 0; q < k1; ++q) segc[k++] = o1 + q * CH;
+    for (int q = 0; q < k2; ++q) segc[k++] = o2 + q * CH;
+    for (int q = 0; q < k3; ++q) segc[k++] = o3 + q * CH;
+    if (t == 0) { segc[nc] = n_pairs; *nsegc = nc; }
     cnt[4 * t] = o0; cnt[4 * t + 1] = o1; cnt[4 * t + 2] = o2; cnt[4 * t + 3] = o3;
     __syncthreads();
     for (int i = t; i < n_pairs; i += 256) perm[atomicAdd(&cnt[expert_ids[i]], 1)] = i;
@@ -3670,19 +3686,21 @@ void launch_moe_expert_ffn_q4k(
             if (gu_sort() && n_pairs <= SI_MOE_PERM_MAX && (moe_slot = moe_slot_for(stream)) != nullptr) {
                 perm = moe_slot->perm;
                 seg = moe_slot->seg;
-                moe_pair_sort_kernel<<<1, 256, 0, stream>>>(expert_ids, n_pairs, perm, seg, seg + SI_MOE_PERM_MAX + 1);
+                moe_pair_sort_kernel<<<1, 256, 0, stream>>>(expert_ids, n_pairs, perm, seg, seg + SI_MOE_PERM_MAX + 1,
+                                                            moe_slot->segc, moe_slot->segc + SI_MOE_PERM_MAX + 1);
             }
             if (perm && gu_group() > 0) {
-                // one warp per (routed expert, R rows); sized for every pair its own expert
-                const int* ns = seg + SI_MOE_PERM_MAX + 1;
+                // one warp per (expert chunk, R rows); sized for every pair its own chunk
+                const int* sc = moe_slot->segc;
+                const int* ns = sc + SI_MOE_PERM_MAX + 1;
                 constexpr int R = 4, W = 4;
                 const dim3 gg((n_pairs * (512 / R) + W - 1) / W), bb(W * 32);
                 if (gu_group() == 2)
-                    gate_up_mmvq2_group_qwen_kernel<2048, 512, 8, W, R, 2><<<gg, bb, 0, stream>>>(q, gq, uq, expert_ids, h_scratch, perm, seg, ns);
+                    gate_up_mmvq2_group_qwen_kernel<2048, 512, 8, W, R, 2><<<gg, bb, 0, stream>>>(q, gq, uq, expert_ids, h_scratch, perm, sc, ns);
                 else if (gu_group() == 8)
-                    gate_up_mmvq2_group_qwen_kernel<2048, 512, 8, W, R, 8><<<gg, bb, 0, stream>>>(q, gq, uq, expert_ids, h_scratch, perm, seg, ns);
+                    gate_up_mmvq2_group_qwen_kernel<2048, 512, 8, W, R, 8><<<gg, bb, 0, stream>>>(q, gq, uq, expert_ids, h_scratch, perm, sc, ns);
                 else
-                    gate_up_mmvq2_group_qwen_kernel<2048, 512, 8, W, R, 4><<<gg, bb, 0, stream>>>(q, gq, uq, expert_ids, h_scratch, perm, seg, ns);
+                    gate_up_mmvq2_group_qwen_kernel<2048, 512, 8, W, R, 4><<<gg, bb, 0, stream>>>(q, gq, uq, expert_ids, h_scratch, perm, sc, ns);
             } else if (gu_rows_r() == 2)
                 gate_up_mmvq2_warp_rows_qwen_kernel<2048, 512, 8, 4, 2><<<g, b, 0, stream>>>(q, gq, uq, expert_ids, h_scratch, n_groups, perm);
             else if (gu_rows_r() == 8)
