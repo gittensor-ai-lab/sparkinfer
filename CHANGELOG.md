@@ -5,6 +5,22 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+### Performance
+
+- **The routed MoE GEMM a prefill (and a served mixed step) runs at 3K+ tokens is pipelined and on
+  m16n8k32.** pfm_moe_gemm_qi8_kernel decoded each weight super-block straight from global, waited
+  at a barrier, then ran wmma 16x16x16: the DRAM read was serialized against the tensor cores, and
+  at a served mixed step's 4096 tokens its gate / up ran at ~165 int8 TOPS. The new kernel takes the
+  dense prefill GEMM's recipe -- a second weight plane, the next super-block fetched into registers
+  before the MMAs and decoded after (now for Q5_K too), m16n8k32 through ldmatrix -- and scatters
+  the down projection with 4-wide vector reductions (a quarter of the atomics). Per layer at 4096
+  tokens: gate / up 395 -> 279 us each, Q5_K down 493 -> 401 us. Single-prompt prefill 4K / 8K
+  32.3K / 34.0K -> 36.3K / 37.0K tok/s. Qwen3.6 served chat (AIPerf, distinct prompts) c16 / c32
+  1,653 / 2,162 -> 1,690 / 2,231 output tok/s; 8K prompts c4 / c16 504 / 619 -> 519 / 646, TTFT p50
+  978 -> 912 ms at c16. Output bit-identical for the gate / up (int32 accumulation, same int8
+  bytes); the scattered down sums the same products in atomic order as before. New GPU test
+  `moe_qi8_k32_gpu_test`. `SPARKINFER_PREFILL_MOE_K32=0` restores the previous kernel.
+
 ## [0.6.23] — 2026-10-05
 
 **Qwen3.6 serving at 32 concurrent requests +17% (1,868 -> 2,193 output tok/s), now within 7% of vLLM

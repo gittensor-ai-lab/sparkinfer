@@ -33,6 +33,12 @@ target_link_libraries(sparse_gate_up_rows_gpu_test PRIVATE sparkinfer_kernels CU
 set_target_properties(sparse_gate_up_rows_gpu_test PROPERTIES CXX_STANDARD 17)
 add_test(NAME sparse_gate_up_rows_gpu_test COMMAND sparse_gate_up_rows_gpu_test)
 set_tests_properties(sparse_gate_up_rows_gpu_test PROPERTIES SKIP_RETURN_CODE 77)
+# The routed BM=128 fused-decode MoE GEMM on m16n8k32 against the wmma kernel it replaces.
+add_executable(moe_qi8_k32_gpu_test moe_qi8_k32_gpu_test.cpp)
+target_link_libraries(moe_qi8_k32_gpu_test PRIVATE sparkinfer_kernels CUDA::cudart)
+set_target_properties(moe_qi8_k32_gpu_test PROPERTIES CXX_STANDARD 17)
+add_test(NAME moe_qi8_k32_gpu_test COMMAND moe_qi8_k32_gpu_test)
+set_tests_properties(moe_qi8_k32_gpu_test PROPERTIES SKIP_RETURN_CODE 77)
 # The bf16 row GEMV's fused multi-chunk launch against one launch per 8-row chunk, bit for bit.
 add_executable(gemv_rows_fuse_gpu_test gemv_rows_fuse_gpu_test.cpp)
 target_link_libraries(gemv_rows_fuse_gpu_test PRIVATE sparkinfer_kernels CUDA::cudart)
