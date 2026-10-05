@@ -9394,7 +9394,25 @@ bool Qwen35Model::load_gguf(const std::string& path) {
             }
             w.gate_q = dev_quant(b + "ffn_gate_exps.weight", w.gate_qtype);   // kept quantized
             w.up_q   = dev_quant(b + "ffn_up_exps.weight",   w.up_qtype);
-            w.down_q = dev_quant(b + "ffn_down_exps.weight", w.down_qtype);
+            // Routed expert downs shipped as Q5_K / Q6_K (Qwen3.6-35B-A3B UD keeps them at Q5_K) are
+            // refit to Q4_K at load, so every routed down read is 4.5 bits a weight instead of 5.5 --
+            // what an NVFP4 expert pool reads. Lossy, as the default Q8_0 -> Q4_K attention refit
+            // above is: over three 4K-token corpus slices perplexity moved -1.7 / -0.3 / +1.7% and
+            // next-token agreement -0.2 / -0.2 / -0.1 points. Served Qwen3.6 (AIPerf chat) c4 / c16
+            // / c32 +3% / +3% / +4%, 8K prompts c4 / c16 +10% / +2%.
+            // SPARKINFER_MOE_DOWN_REQUANT_Q4K=0 keeps the GGUF's own down tensor (qwen3_gguf_score
+            // sets that, so teacher-forced scoring reads the checkpoint as shipped).
+            // On by default for the Qwen3.6 hybrid-MoE fingerprint it was measured on; other MoE
+            // checkpoints take it with SPARKINFER_MOE_DOWN_REQUANT_Q4K=1.
+            static const int moe_down_env = [] {
+                const char* e = getenv("SPARKINFER_MOE_DOWN_REQUANT_Q4K");
+                return e ? (e[0] == '1' ? 1 : 0) : -1;
+            }();
+            const bool moe_down_q4k = moe_down_env >= 0 ? moe_down_env == 1
+                                                         : is_qwen35_or_qwen36_hybrid_moe(g);
+            w.down_q = moe_down_q4k
+                ? dev_quant_requant_q4k(b + "ffn_down_exps.weight", w.down_qtype, true, /*allow_q5k=*/true)
+                : dev_quant(b + "ffn_down_exps.weight", w.down_qtype);
             if (s.cfg.n_shared > 0) {
             if (!expect_dims(b + "ffn_gate_shexp.weight", {H, c.moe_ffn}) ||
                 !expect_dims(b + "ffn_up_shexp.weight", {H, c.moe_ffn}) ||

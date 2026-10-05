@@ -5,6 +5,19 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+### Performance
+
+- **Qwen3.6's routed expert downs are refit from Q5_K to Q4_K at load**, so each routed down read
+  is 4.5 bits a weight instead of 5.5 -- the size an NVFP4 expert pool reads -- and the batched
+  decode groups them by expert with a new Q4_K kernel (down_q4k_group_qwen_kernel, the Q5_K one's
+  twin). Lossy, like the default Q8_0 -> Q4_K attention refit this checkpoint already gets: over
+  three 4K-token corpus slices perplexity moved -1.7 / -0.3 / +1.7% and next-token agreement -0.2 /
+  -0.2 / -0.1 points. Served chat (AIPerf, distinct prompts) c4 / c16 / c32 918 / 1,697 / 2,188 ->
+  948 / 1,745 / 2,281 output tok/s (two runs each), 8K prompts c4 / c16 524 / 646 -> 574 / 662.
+  On for the Qwen3.5/3.6 hybrid-MoE fingerprint; `SPARKINFER_MOE_DOWN_REQUANT_Q4K=0` keeps the
+  GGUF's tensor (and `qwen3_gguf_score` sets that, so teacher-forced scoring still reads the
+  checkpoint as shipped), `=1` turns it on for other MoE checkpoints.
+
 ## [0.6.26] — 2026-10-05
 
 **Qwen3.6 prompt processing on 1-2K-token steps +5-8%: the pipelined routed MoE GEMM covers the

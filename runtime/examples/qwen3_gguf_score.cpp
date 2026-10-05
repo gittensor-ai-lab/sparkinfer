@@ -33,6 +33,7 @@ int main(int argc, char** argv) {
     // requant defaults); those paths diverge from the reference and falsely fail the correctness
     // gate (~79-83% top1). overwrite=1 so evaluate_bidir's export cannot leak into scoring.
     setenv("SPARKINFER_DOWN_REQUANT_Q4K", "0", 1);
+    setenv("SPARKINFER_MOE_DOWN_REQUANT_Q4K", "0", 1);   // the routed expert downs too
 
     const std::string path = argv[1];
     const int topk = atoi(argv[2]);

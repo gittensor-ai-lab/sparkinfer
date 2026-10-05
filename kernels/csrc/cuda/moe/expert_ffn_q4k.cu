@@ -2039,6 +2039,50 @@ __global__ void __launch_bounds__(WARPS * 32) down_q5k_group_qwen_kernel(
     }
     }
 }
+// down_q5k_group_qwen_kernel for a Q4_K down (the expert pool refit at load, see
+// SPARKINFER_MOE_DOWN_REQUANT_Q4K in qwen35.cpp): the same expert-grouped walk and dpart output,
+// with the Q4_K lane decode the grouped gate/up uses (si_q4k_decode_w + si_vec_dot_q4_K_wa).
+template <int H, int F, int TOPK, int WARPS, int R>
+__global__ void __launch_bounds__(WARPS * 32) down_q4k_group_qwen_kernel(
+    const unsigned char* __restrict__ down_q, const int* __restrict__ expert_ids,
+    const si_block_q8_1* __restrict__ hq8, float* __restrict__ dpart, const int* __restrict__ perm,
+    const int* __restrict__ seg, const int* __restrict__ nseg) {
+    static_assert(F == 512, "one Q4_K word pair a lane: F / 256 super-blocks x 16 positions = 32");
+    constexpr int FB = H / R;
+    constexpr int NB = F >> 8, Q8PB = F >> 5;
+    const int lane = threadIdx.x & 31;
+    const int n_tasks = *nseg * FB;
+    for (int g = blockIdx.x * WARPS + (int)(threadIdx.x >> 5); g < n_tasks; g += gridDim.x * WARPS) {
+    const int s = g / FB;
+    const int h0 = (g - s * FB) * R;
+    const int lo = seg[s], hi = seg[s + 1];
+    const int e = expert_ids[perm[lo]];
+    const int kbx = lane >> 4, kqs = (lane & 15) << 1;
+    si_q4k_wdec w[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r)
+        w[r] = si_q4k_decode_w(reinterpret_cast<const si_block_q4_K*>(
+                   down_q + ((size_t)e * H + h0 + r) * NB * 144) + kbx, kqs);
+    for (int i = lo; i < hi; ++i) {
+        const int ts = perm[i];
+        const si_q8a a = si_q8a_load(hq8 + (size_t)ts * Q8PB + (size_t)kbx * 8, kqs);
+        float t[R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) t[r] = si_vec_dot_q4_K_wa(w[r], a);
+#pragma unroll
+        for (int r = 0; r < R; ++r)
+#pragma unroll
+            for (int m = 16; m > 0; m >>= 1) t[r] += __shfl_xor_sync(0xffffffffu, t[r], m);
+        if (lane < R) {
+            float v = t[0];
+#pragma unroll
+            for (int r = 1; r < R; ++r) if (lane == r) v = t[r];
+            dpart[(size_t)ts * H + h0 + lane] = v;
+        }
+    }
+    }
+}
+
 // output[token][hh] = sum over slots j in order of expert_weights[token, j] * dpart[(token, j)][hh].
 template <int TOPK>
 __global__ void moe_down_combine_kernel(const float* __restrict__ dpart, const float* __restrict__ expert_weights,
@@ -3975,6 +4019,20 @@ void launch_moe_expert_ffn_q4k(
         else
             launch_pdl_kernel(q_pdl, dim3((nqb + (qthreads >> 5) - 1) / (qthreads >> 5)), dim3(qthreads), 0, stream,
                 quant_h_q8_1_kernel, h_scratch, hq8, nqb, q_pdl);
+        // Qwen3.6's routed down refit to Q4_K: by expert over the gate/up's sort, as the Q5_K one.
+        if (moe_slot && !ar_exact_splitk && top_k == 8 && hidden == 2048 && ffn == 512 &&
+            num_tokens * top_k <= SI_MOE_PERM_MAX) {
+            constexpr int R = 4, W = 4;
+            const int n_pairs = num_tokens * top_k;
+            const dim3 gg((n_pairs * (2048 / R) + W - 1) / W), bb(W * 32);
+            down_q4k_group_qwen_kernel<2048, 512, 8, W, R><<<gg, bb, 0, stream>>>(
+                reinterpret_cast<const unsigned char*>(down_q), expert_ids, hq8, moe_slot->dpart,
+                moe_slot->perm, moe_slot->seg, moe_slot->seg + SI_MOE_PERM_MAX + 1);
+            const int n = num_tokens * hidden;
+            moe_down_combine_kernel<8><<<(n + 255) / 256, 256, 0, stream>>>(
+                moe_slot->dpart, expert_weights, reinterpret_cast<__nv_bfloat16*>(output), hidden, n);
+            return;
+        }
         int S = dense_top1_down_splitk(down_splitk_s_q4(), top_k, "SPARKINFER_DOWN_SPLITK_S_Q4");
         // The split-K factor was fitted at ONE row, where splitting hides a bs=1 occupancy stall.
         // A packed batch already gives every block M rows of work, so the extra splits buy
