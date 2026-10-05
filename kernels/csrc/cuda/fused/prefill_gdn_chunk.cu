@@ -152,12 +152,18 @@ __global__ void pf_gdnc_prep_kernel(const __nv_bfloat16* __restrict__ q,
     __syncthreads();
     for (int i = tid; i < len; i += nthr) g_buf[(size_t)(t0 + i) * v_heads + h] = s_g[i];
 
-    // ---- stage K and Q ----
-    for (int e = tid; e < C * HD; e += nthr) {
-        const int i = e / HD, d = e - i * HD;
-        const bool live = i < len;
-        s_k[i * (HD + PAD) + d] = live ? k[(size_t)(t0 + i) * q_dim + qh * HD + d] : __float2bfloat16(0.f);
-        s_x[i * (HD + PAD) + d] = live ? q[(size_t)(t0 + i) * q_dim + qh * HD + d] : __float2bfloat16(0.f);
+    // ---- stage K and Q, 8 values (16 B) a load: the rows are contiguous in d and every base is
+    // 16-byte aligned (HD, q_dim and the HD+PAD smem stride are multiples of 8). Same bytes. ----
+    static_assert(HD % 8 == 0 && (HD + PAD) % 8 == 0, "16-byte staging");
+    for (int e8 = tid; e8 < (C * HD) / 8; e8 += nthr) {
+        const int i = e8 / (HD / 8), d = (e8 - i * (HD / 8)) * 8;
+        uint4 kv = make_uint4(0u, 0u, 0u, 0u), qv = make_uint4(0u, 0u, 0u, 0u);
+        if (i < len) {
+            kv = *reinterpret_cast<const uint4*>(k + (size_t)(t0 + i) * q_dim + qh * HD + d);
+            qv = *reinterpret_cast<const uint4*>(q + (size_t)(t0 + i) * q_dim + qh * HD + d);
+        }
+        *reinterpret_cast<uint4*>(s_k + i * (HD + PAD) + d) = kv;
+        *reinterpret_cast<uint4*>(s_x + i * (HD + PAD) + d) = qv;
     }
     __syncthreads();
 
@@ -200,6 +206,15 @@ __global__ void pf_gdnc_prep_kernel(const __nv_bfloat16* __restrict__ q,
         }
     }
     __syncthreads();
+    // Q's last reader was the tile above, so V can start streaming into s_x now, behind the
+    // triangular solve and W^ (which read only s_A, s_k and the gates); it is waited on just
+    // before U0. Rows past len are zeroed there instead (cp.async cannot predicate).
+    for (int e8 = tid; e8 < (C * HD) / 8; e8 += nthr) {
+        const int i = e8 / (HD / 8), d = (e8 - i * (HD / 8)) * 8;
+        if (i < len)
+            __pipeline_memcpy_async(s_x + i * (HD + PAD) + d, v + (size_t)(t0 + i) * v_dim + h * HD + d, 16);
+    }
+    __pipeline_commit();
 
     // ---- T = (I + A)^-1 in place, by forward substitution over rows ----
     //   T[i][j] = -A[i][j] - sum_{m=j+1}^{i-1} A[i][m] T[m][j]      (T[j][j] = 1)
@@ -305,11 +320,13 @@ __global__ void pf_gdnc_prep_kernel(const __nv_bfloat16* __restrict__ q,
     }
     __syncthreads();
 
-    // ---- reuse the Q tile for V, then U0 = T . (b_m v_m) ----
-    for (int e = tid; e < C * HD; e += nthr) {
-        const int i = e / HD, d = e - i * HD;
-        s_x[i * (HD + PAD) + d] = (i < len) ? v[(size_t)(t0 + i) * v_dim + h * HD + d] : __float2bfloat16(0.f);
-    }
+    // ---- V (in flight since the A/M tile) in the Q tile, then U0 = T . (b_m v_m) ----
+    __pipeline_wait_prior(0);
+    if (len < C)
+        for (int e8 = tid; e8 < (C * HD) / 8; e8 += nthr) {
+            const int i = e8 / (HD / 8), d = (e8 - i * (HD / 8)) * 8;
+            if (i >= len) *reinterpret_cast<uint4*>(s_x + i * (HD + PAD) + d) = make_uint4(0u, 0u, 0u, 0u);
+        }
     __syncthreads();
     {
         // Same m-outermost form as W^ above (bit-identical), store guarded by i < len (#604/#608).
