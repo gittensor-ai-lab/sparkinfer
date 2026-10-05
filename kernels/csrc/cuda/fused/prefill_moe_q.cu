@@ -1169,14 +1169,16 @@ __global__ __launch_bounds__(256, 2) void pfm_moe_gemm_qi8_k32_kernel(
         const bool more = (sb + 1) < nsb;
         if (more && drow_ok) fetch(drow + (size_t)(sb + 1) * BS);
         for (int kk = 0; kk < QM_SB; kk += QM_BK, kstep++) {
-            // Issue step kstep+NA-1 into the slot step kstep-1 used (its readers are past the
-            // barrier that closed the previous step), then wait for step kstep itself. Every
-            // thread commits one group per step -- empty past the end -- so the count is uniform.
+            // ONE barrier a K step. Wait for step kstep's own copies, then the barrier publishes
+            // them AND proves every warp is past step kstep-1 -- so only after it is the slot step
+            // kstep-1 used refilled, with step kstep+NA-1. (Issuing that copy before the barrier
+            // is what needed a second barrier at the bottom of every step.) Every thread commits
+            // one group per step -- empty past the end -- so the count stays uniform.
+            __pipeline_wait_prior(NA - 2);
+            __syncthreads();
             const int kfut = kstep + NA - 1;
             if (kfut < nks) stageA(kfut % NA, kfut * QM_BK);
             else            __pipeline_commit();
-            __pipeline_wait_prior(NA - 1);
-            __syncthreads();
             const unsigned ab = a_sm + (unsigned)(kstep % NA) * (BMT * QM_BK);
             unsigned af32[2][4];
 #pragma unroll
@@ -1191,7 +1193,6 @@ __global__ __launch_bounds__(256, 2) void pfm_moe_gemm_qi8_k32_kernel(
                     qm_mma_16832(acc[i][2 * j2 + 1], af32[i], bb[2], bb[3]);
                 }
             }
-            __syncthreads();
         }
         if (more && drow_ok) decode(&Bs[bbuf ^ 1][dr][0]);
         bbuf ^= 1;

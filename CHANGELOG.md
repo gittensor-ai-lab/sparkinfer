@@ -5,6 +5,14 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+### Performance
+
+- **The pipelined routed MoE GEMM takes one barrier a K step instead of two**: the next activation
+  step is issued after the step's own barrier (which already proves every warp is past the slot
+  being refilled), so the barrier at the bottom of every step goes. Phase timing (clock64) had the
+  K loop at ~470 cycles a step for a handful of MMAs. 1K-token step: gate / up 128 -> 125 us, down
+  156 -> 147 us; Qwen3.6 prefill 1K / 2K 25.4K / 33.0K -> 26.1K / 33.7K tok/s. Same values.
+
 ## [0.6.27] — 2026-10-05
 
 **Qwen3.6 serving +3-10%: its routed expert downs are read at 4.5 bits a weight instead of 5.5.
