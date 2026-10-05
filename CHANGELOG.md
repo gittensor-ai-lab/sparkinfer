@@ -5,6 +5,25 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+### Fixed
+
+- **A request with `ignore_eos` speculates.** Since 0.6.13 (#1265) `spec_eligible` refused it,
+  because the speculative paths only knew the process-wide `SPARKINFER_BENCH_IGNORE_EOS`. Every
+  fixed-length benchmark sets `ignore_eos` (AIPerf, vLLM's and SGLang's bench tools), so a server
+  with a draft loaded decoded those requests token by token, while vLLM speculates through them.
+  The request's flag now rides `SpecHooks` into `dflash_generate` and the group's emit, bonus-token
+  and handover EOS tests: an EOS is emitted like any other token and decoding runs to `max_tokens`.
+  Lossless: plain against draft, `SPARKINFER_DETERMINISTIC=1` and the prefix cache off, four prompts
+  at T=0 and T=0.7, each with and without `ignore_eos`: 16 of 16 completions identical (the
+  `ignore_eos` ones run past the model's own EOS, "Say hi." 41 -> 400 tokens).
+- **Measured** (Qwen3.8-27B NVFP4 + z-lab DFlash2, AIPerf streaming chat 1024 / 256, T=0.7,
+  top_k 20, top_p 0.95, `ignore_eos`, output tok/s at 1 / 2 / 4 / 8 requests): 96 / 183 / 321 /
+  554 -> **227 / 385 / 578 / 785**; vLLM 0.30.0 with the same draft 196 / 313 / 381 / 426. On
+  ShareGPT prompts (their own answer lengths): **193 / 354 / 581 / 533** against vLLM's 163 / 237 /
+  338 / 346 (plain decode 100 / 186 / 313 / 435). Draft loaded, AIPerf default sampling, chat 4
+  requests 322 -> 577, 8K prompts at 4 requests 190 -> 235; at 16-32 requests (past the group size,
+  where the draft steps off the device) 885 / 1,275 -> 864 / 1,234, 8K c16 273 -> 269.
+
 ## [0.6.29] — 2026-10-05
 
 **Long-prompt prefill +4-8% on both models (a 2.2x faster Gated-DeltaNet scan). In one same-day

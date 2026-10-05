@@ -320,6 +320,9 @@ public:
         unsigned long long seed = 0;
         int top_k = 0;
         float top_p = 1.f;
+        // The request's ignore_eos: an EOS is emitted like any other token and the run goes on to
+        // max_new_tokens (as SPARKINFER_BENCH_IGNORE_EOS does for the bench binaries).
+        bool ignore_eos = false;
     };
     struct SpecResume {
         bool engaged = false;   // false: nothing ran -- speculation would not pay here, or could not start

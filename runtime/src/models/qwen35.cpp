@@ -7000,7 +7000,7 @@ std::vector<int> Qwen35Model::dflash_generate(const std::vector<int>& prompt, in
                                               DFlashStats* stats, ThermalGovernor* gov,
                                               const SpecHooks* hooks, SpecResume* resume) {
     Impl& s = *p_;
-    const bool ignore_eos = [] {
+    const bool ignore_eos = (hooks && hooks->ignore_eos) || [] {
         const char* e = getenv("SPARKINFER_BENCH_IGNORE_EOS");
         return e && e[0] == '1';
     }();

@@ -403,7 +403,7 @@ bool ContinuousBatchEngine::spec_eligible(const Request& r) {
         const char* e = getenv("SPARKINFER_SPEC_SAMPLED");
         return !(e && e[0] == '0');
     }();
-    return !r.constraint && !r.ignore_eos && (r.temperature <= 0.f || sampled_on) && r.presence_penalty == 0.f &&
+    return !r.constraint && (r.temperature <= 0.f || sampled_on) && r.presence_penalty == 0.f &&
            r.frequency_penalty == 0.f && r.logit_bias.empty() && !r.logprobs &&
            r.forced_tokens.empty() && r.vision_pos.empty() && !r.use_prefix_session &&
            (r.prefill_start == 0 || prefix_hit_spec_on());
@@ -534,7 +534,7 @@ void ContinuousBatchEngine::run_spec_group() {
             finish(m);
             return false;
         }
-        const bool eos = tok == cfg.eos_id || (cfg.eos_id2 >= 0 && tok == cfg.eos_id2);
+        const bool eos = !job.req.ignore_eos && (tok == cfg.eos_id || (cfg.eos_id2 >= 0 && tok == cfg.eos_id2));
         const bool limit = job.decode_emitted >= job.req.max_new_tokens;
         if (eos || limit) {
             job.reached_token_limit = limit && !eos;
@@ -740,6 +740,7 @@ void ContinuousBatchEngine::run_spec_group() {
             hooks.seed = joiner->req.seed;
             hooks.top_k = joiner->req.top_k;
             hooks.top_p = joiner->req.top_p;
+            hooks.ignore_eos = joiner->req.ignore_eos;
             hooks.prefill_start = joiner->req.prefill_start;
             const int n = (int)joiner->req.prompt.size();
             std::vector<int> ckpts;
@@ -1003,7 +1004,7 @@ void ContinuousBatchEngine::run_spec_group() {
             m.feed_len = k;
             if (!m.adopted) spec_tokens_.fetch_add((uint64_t)k, std::memory_order_relaxed);
             // A bonus EOS ends the request here, as dflash_generate does.
-            if (m.next == cfg.eos_id || (cfg.eos_id2 >= 0 && m.next == cfg.eos_id2))
+            if (!m.job->req.ignore_eos && (m.next == cfg.eos_id || (cfg.eos_id2 >= 0 && m.next == cfg.eos_id2)))
                 if (emit(m, m.next)) m.next_emitted = true;
         }
     }
@@ -1036,6 +1037,7 @@ void ContinuousBatchEngine::run_speculative(Job& job) {
     hooks.seed = job.req.seed;
     hooks.top_k = job.req.top_k;
     hooks.top_p = job.req.top_p;
+    hooks.ignore_eos = job.req.ignore_eos;
     hooks.on_tokens = [&](const int* tokens, int n) -> bool {
         for (int i = 0; i < n; i++) {
             const auto t_emit = std::chrono::steady_clock::now();
@@ -1111,7 +1113,8 @@ void ContinuousBatchEngine::run_speculative(Job& job) {
     };
     if (job.cancelled || job.timed_out) { finish(); return; }
     const int last = job.output.empty() ? -1 : job.output.back();
-    const bool hit_eos = last >= 0 && (last == cfg.eos_id || (cfg.eos_id2 >= 0 && last == cfg.eos_id2));
+    const bool hit_eos = last >= 0 && !job.req.ignore_eos &&
+                         (last == cfg.eos_id || (cfg.eos_id2 >= 0 && last == cfg.eos_id2));
     const bool hit_limit = job.decode_emitted >= job.req.max_new_tokens;
     if (r.failed || r.emitted != job.decode_emitted ||
         (!r.finished && !hit_eos && !hit_limit && r.position != prompt_len + job.decode_emitted)) {
