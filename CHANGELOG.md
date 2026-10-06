@@ -5,6 +5,12 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+## [0.6.31] — 2026-10-06
+
+**Muse Glimmer serves 8K prompts 1.8-2.5x faster: its KV cache is int8 by default, so twice as many
+long requests fit. Against llama.cpp on the same GGUF, sparkinfer leads every Muse Glimmer serving
+cell (1.4-3.7x).**
+
 ### Performance
 
 - **Muse Glimmer takes an int8 KV cache by default.** It was held on bf16 after #779 (garbage from
