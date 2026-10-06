@@ -5320,12 +5320,15 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         const int v = e ? atoi(e) : 7;
         return (v >= 0 && v <= 7) ? v : 7;
     }();
-    // Rows at which the packed projections leave the row-GEMVs for the block-scaled GEMM. 8 is
-    // the smallest width its A-quantizer takes (m % 8 == 0); since the transposed orientation
-    // the GEMM is ahead there too (cb-decode@c8 558.7 -> 585.0 tok/s).
+    // Rows at which the packed projections leave the row-GEMVs for the block-scaled GEMM. It was
+    // 8 because the A-quantizer takes m % 8 == 0, but the A operand is padded to Ng = (N + 7) & ~7
+    // rows here (the pad rows ride in a tile the GEMM runs anyway and are never read), so a
+    // narrower step takes it too. From four rows the GEMM is ahead of the row-GEMVs; at two it
+    // is not (Qwen3.8-27B ModelOpt cb-decode@c2 175.5 -> 172.9 tok/s with the floor at 2).
+    // With the FFN's floor below (kFfnGemmMinRows) at 2: cb-decode@c4 297.5 -> 336.2 tok/s.
     static const int kProjGemmMinRows = [] {
         const char* e = getenv("SPARKINFER_PROJ_GEMM_MIN_ROWS");
-        const int v = e ? atoi(e) : 8;
+        const int v = e ? atoi(e) : 4;
         return v < 1 ? 1 : v;
     }();
     unsigned char* fp4_a = nullptr; unsigned char* fp4_asf = nullptr; unsigned char* fp4_ws = nullptr;
@@ -7089,10 +7092,14 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             // m % 8 == 0), and on the prefill fp4 operands being resident -- they are whenever
             // SPARKINFER_QWEN38_PREFILL_NVFP4 is on. The floor was 16, fitted when the GEMM
             // still ran its prefill tiling at these widths; since the transposed orientation it
-            // is ahead of the row-GEMVs at 8 rows too (cb-decode@c8 558.7 -> 587.4 tok/s).
+            // is ahead of the row-GEMVs at 8 rows too (cb-decode@c8 558.7 -> 587.4 tok/s). And
+            // below eight: the A operand is padded to Ng rows (see Ng), and one GEMM per
+            // projection reads each FFN weight once where the row-GEMVs' ~1.5 TB/s pass reads it
+            // at every width (Qwen3.8-27B ModelOpt cb-decode@c4 297.5 -> 330.7, @c2 175.5 ->
+            // 178.9 tok/s with the floor at 2).
             static const int kFfnGemmMinRows = [] {
                 const char* e = getenv("SPARKINFER_FFN_GEMM_MIN_ROWS");
-                const int v = e ? atoi(e) : 8;
+                const int v = e ? atoi(e) : 2;
                 return v < 1 ? 1 : v;
             }();
             const bool ffn_gemm = wide && topk == 1 && fp4_a && fp4_asf &&
