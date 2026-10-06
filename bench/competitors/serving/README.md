@@ -68,7 +68,7 @@ same box. Output tok/s, **sparkinfer** / vLLM.
 | Qwen3.6-35B-A3B | **1.31 / 3.33 / 8.28 s** | 1.39 / 3.67 / 9.46 s |
 
 Muse Glimmer 30B (GGUF only, so against llama.cpp `436f6f8`: `WHICH="sparkinfer llamacpp"`, the same
-UD-Q4_K_M-style file on both, `-fa on`, 32 slots), `cells.sh` with
+`Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf` on both, `-fa on`, 32 slots), `cells.sh` with
 `AIP_EXTRA='--extra-inputs enable_thinking:true'`, sparkinfer 0.6.31:
 
 | chat c4 | chat c16 | chat c32 | 8K c4 | 8K c16 |
