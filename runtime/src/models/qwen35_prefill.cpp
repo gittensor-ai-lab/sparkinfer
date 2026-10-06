@@ -49,6 +49,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <mutex>
 #include <vector>
 
@@ -122,6 +123,17 @@ struct Arena {
         sizes.insert(sizes.begin() + cursor, bytes);
         ++cursor;
         return static_cast<T*>(p);
+    }
+    // What the next allocs (bytes each, in order) would take from the device: alloc() hands back a
+    // slot that is big enough and replaces one that is not, so only the growth is new memory.
+    size_t fresh(std::initializer_list<size_t> asks) const {
+        size_t f = 0, i = cursor;
+        for (size_t b : asks) {
+            const size_t have = i < sizes.size() ? sizes[i] : 0;
+            if (b > have) f += b - have;
+            ++i;
+        }
+        return f;
     }
     void rewind() { cursor = 0; used = 0; ok = true; }
     void free_all() {
@@ -986,11 +998,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             // floor -- the measured WORST point of the chunk curve above, 1.58% behind a 4-chunk
             // pass. dspark_tau_check pins SPARKINFER_PREFILL_I8=0 and 32768 is below bf16_minctx,
             // so need_i8 is false on exactly the path the scored prefill takes.
-            const size_t tail = (size_t)maxw * sizeof(bf16)                    // wbuf
-                              + (need_i8 ? (size_t)maxw : 0)                   // W_i8
+            const size_t tail = (need_i8 ? (size_t)maxw : 0)                   // W_i8
                               + (need_i8 ? (size_t)N * H : 0)                  // A_i8 (int8) floor
-                              + (need_i8 ? (size_t)N * sizeof(float) : 0)      // sx
-                              + (size_t)N * sizeof(int);                       // d_ids
+                              + (need_i8 ? (size_t)N * sizeof(float) : 0);     // sx
             const size_t margin = (size_t)64 << 20;    // split-K partials + allocator slack
             // The chunk-parallel GDN scan draws on this same budget, AFTER this point, and it is
             // the larger consumer: its workspace is O(N) (~483 MB at ctx=16384). Sizing the FFN
@@ -1005,9 +1015,18 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             const size_t claimed = tail + margin + gdn_reserve;
             const size_t avail = (fb > claimed) ? fb - claimed : 0;
             const int fc_before = FC;
+            // What the pair, wbuf and d_ids (allocated right below, in this order) take beyond the
+            // slots the kept arena already holds for them. The previous pass of this size left
+            // them there, and what a pass keeps beside itself (MuseStreamCache: everything free
+            // past 512 MB) is sized against that arena -- charging the pair as fresh VRAM halved
+            // Muse's 4096-token chunk to 1024 on every pass after the first (14613 -> 15299 pp
+            // pinned). On a first pass the arena holds nothing and this is the old sum.
+            auto need = [&](int fc) {
+                const size_t pair = (size_t)fc * (size_t)ffn * sizeof(bf16);
+                return a.fresh({pair, pair, (size_t)maxw * sizeof(bf16), (size_t)N * sizeof(int)});
+            };
             // Test the HALVED value, not the current one: `FC > floor` would step straight past it.
-            while ((FC >> 1) >= kMinFfnChunk &&
-                   (size_t)2 * (size_t)FC * (size_t)ffn * sizeof(bf16) > avail)
+            while ((FC >> 1) >= kMinFfnChunk && need(FC) > avail)
                 FC >>= 1;
             if (FC != fc_before)
                 fprintf(stderr, "[prefill] ffn chunk %d -> %d (ctx=%d, free=%zu MB) to keep the "
