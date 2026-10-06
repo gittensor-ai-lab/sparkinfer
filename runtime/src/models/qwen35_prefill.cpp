@@ -5050,15 +5050,19 @@ static bool muse_packed_on() {
 //     c=4   min_rows 6 -> 191.6 / 191.2 tok/s     min_rows 2 -> 208.7 / 208.8   +9.0%
 //     c=2   min_rows 6 -> 137.1 / 137.1           min_rows 2 -> 126.9           -7.4%
 //
-// So the GEMM is worth taking from four rows up and not below, which is what this returns. A
-// four-row packed step is a scored continuous-batch width, and at four rows every other arm in the
-// step is still on the dp4a path -- every tensor-core arm has an eight-row floor, because an
-// m16n8k32 tile pads M to sixteen. This is the one place a narrow batch can reach the tensor cores,
-// and the fitted six was keeping it off them.
+// That -7.4% at two rows was measured while the rest of a two-row step still ran Q4_K: the
+// q|gate|k|v projection and the o projection have since moved onto the block-scaled GEMM from two
+// rows and one row (SPARKINFER_MUSE_QKVG_MIN_ROWS, SPARKINFER_MUSE_PACKED_WO_MIN_ROWS), so a
+// two-row step already pays for the A-operand quantize and the GEMM's eight-row padding, while its
+// FFN was the last part left on the row GEMVs: gate_up_q3a_muse_rows and the sparse mmvq2 (4.8 ms)
+// and the Q4_K down rows (3.0 ms) of a 12.3 ms c2 step on an RTX 5090. Taken from two rows, the
+// step is the four-row step's GEMMs, 12.27 -> 11.50 ms. Measured on main c8d47d5, same binary
+// (SPARKINFER_GU_GEMM_MIN_ROWS=4 vs 2): cb-decode@c2 158.3 / 157.7 -> 173.1 / 173.0 tok/s.
+// Four rows and up take it as before.
 static int gu_gemm_min_rows() {
     static const int v = [] {
         const char* e = getenv("SPARKINFER_GU_GEMM_MIN_ROWS");
-        const int x = e ? atoi(e) : 4;
+        const int x = e ? atoi(e) : 2;
         return x < 1 ? 1 : x;
     }();
     return v;
