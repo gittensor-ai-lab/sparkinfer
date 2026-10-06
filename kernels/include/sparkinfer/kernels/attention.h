@@ -177,7 +177,11 @@ void launch_flash_decode_split(
     // Opt-in for the head_dim=128 gated combine. Defaults OFF so no existing caller can change
     // behaviour: only Muse Glimmer, which is the only model instantiating the hd128 gated
     // kernel, passes 1.
-    int gated_combine_hd128 = 0);
+    int gated_combine_hd128 = 0,
+    // The rows are independent sequences taking one decode step each (packed continuous-batch
+    // decode), not consecutive positions of one sequence: lets the int8 16:1 GQA split pick its
+    // split count from the row count (SPARKINFER_FAGQA16_I8ROWS). Defaults off.
+    int independent_rows = 0);
 
 // Flash decode for GLOBAL layers: full context, head_dim=512, GQA 8:1.
 // Two-phase dot product splits 512-dim head into two 256-dim halves.

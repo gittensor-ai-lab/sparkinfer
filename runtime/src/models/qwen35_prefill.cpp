@@ -6458,14 +6458,14 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                     qb, kp, vp, swa_vtbl, swa_vlen, att, fa_m, fa_l, fa_acc,
                     N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, swa_budget, swa_vsplits,
                     1.f / sqrtf((float)c.head_dim), st, attn_q8, swa_budget * bs,
-                    ks, vs, kv8 ? 1 : 0, attn_gate, gq8_hd128);
+                    ks, vs, kv8 ? 1 : 0, attn_gate, gq8_hd128, packed ? 1 : 0);
             } else {
                 kernels::launch_flash_decode_split(
                     qb, kp, vp, rtab, seq, att, fa_m, fa_l, fa_acc,
                     N, c.n_q_heads, c.n_kv_heads, c.head_dim, bs, mbs, ns,
                     1.f / sqrtf((float)c.head_dim), st, attn_q8,
                     packed ? packed_seq_hint : start_pos + N,
-                    ks, vs, kv8 ? 1 : 0, attn_gate, gq8_hd128);
+                    ks, vs, kv8 ? 1 : 0, attn_gate, gq8_hd128, packed ? 1 : 0);
             }
             // The o projection through the block-scaled FP4 copy prefill already holds, with the
             // gate folded into its quantize, instead of the Q4_K mma rows. Rows past N are scratch.

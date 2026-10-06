@@ -1712,7 +1712,7 @@ void launch_flash_decode_split(
     int num_seqs, int num_q_heads, int num_kv_heads, int head_dim,
     int block_size, int max_blocks, int n_splits, float scale, cudaStream_t stream,
     void* out_q8, int seqlen, const void* k_scale, const void* v_scale, int int8_kv,
-    const void* attn_gate, int gated_combine_hd128
+    const void* attn_gate, int gated_combine_hd128, int independent_rows
 ) {
     const __nv_bfloat16* gate = reinterpret_cast<const __nv_bfloat16*>(attn_gate);
     // hd256 already had a gated combine; hd128 only gets one when the caller explicitly opts in,
@@ -2213,6 +2213,44 @@ void launch_flash_decode_split(
             fa_launch_combine_dispatch(part_m, part_l, part_acc, reinterpret_cast<__nv_bfloat16*>(out),
                                        num_q_heads, ns, reinterpret_cast<fa_block_q8_1*>(out_q8), num_seqs, stream);
         (void)seqlen;
+        return;
+    }
+    // int8 KV with several rows: the same split rule on the int8 tensor-core split. The caller's
+    // split count is sized for a single row's longest context -- a windowed layer passes its
+    // 2048-token window / 32 = 64 -- so at the continuous-batch bench's ~300-token rows each split
+    // held ~5 keys, a 16-row step launched 2048 near-empty blocks per layer and the combine folded
+    // 64 partials; the global layers' short hint missed the MMA gate and took the scalar tile.
+    // Muse Glimmer cb at 256+256 tokens: ITL c16 12.52 -> 11.57 ms, c32 14.73 -> 12.41 ms. Fewer
+    // splits change only how the softmax partials are grouped before the combine.
+    // SPARKINFER_FAGQA16_I8ROWS=0 restores the caller's split count and kernel choice.
+    static int fagqa16_i8rows = -1;
+    if (fagqa16_i8rows < 0) { const char* e = getenv("SPARKINFER_FAGQA16_I8ROWS"); fagqa16_i8rows = (e && e[0] == '0') ? 0 : 1; }
+    if (fagqa16_i8rows && independent_rows && fagqa16 && fagqa16_mma && famma && int8_kv && num_seqs >= 2 &&
+        head_dim == 128 && block_size == 16 && num_kv_heads > 0 && num_q_heads == num_kv_heads * 16) {
+        constexpr int GQA = 16;
+        constexpr int MMA_THREADS = fa_mma_block_threads<128, GQA>::v;
+        const int rows = num_seqs * num_kv_heads;
+        int ns = rows <= 8 ? 16 : rows <= 32 ? 8 : 4;
+        const int by_len = seqlen > 0 ? (seqlen + 31) / 32 : ns;   // >= 32 keys a split
+        if (ns > by_len) ns = by_len;
+        if (ns > n_splits) ns = n_splits;                          // partials are sized for n_splits
+        if (ns < 1) ns = 1;
+        const size_t i8_smem = (size_t)2 * 16 * 128 * sizeof(signed char)
+                             + (size_t)(16 + GQA) * 128 * sizeof(float)
+                             + (size_t)(16 + 16 + 128 + 128 + 16 + 16) * sizeof(float);
+        dim3 gq(num_kv_heads * ns, num_seqs);
+        fa_split_gqa_mma_i8_kernel<128, GQA><<<gq, MMA_THREADS, i8_smem, stream>>>(
+            reinterpret_cast<const __nv_bfloat16*>(q), reinterpret_cast<const signed char*>(k_pool),
+            reinterpret_cast<const signed char*>(v_pool), block_table, seq_lens,
+            part_m, part_l, part_acc, scale, num_q_heads, num_kv_heads, block_size, max_blocks, ns,
+            ksc, vsc);
+        if (gate128)
+            fa_launch_combine_gated_dispatch(part_m, part_l, part_acc, reinterpret_cast<__nv_bfloat16*>(out),
+                                             gate, num_q_heads, ns,
+                                             reinterpret_cast<fa_block_q8_1*>(out_q8), num_seqs, stream);
+        else
+            fa_launch_combine_dispatch(part_m, part_l, part_acc, reinterpret_cast<__nv_bfloat16*>(out),
+                                       num_q_heads, ns, reinterpret_cast<fa_block_q8_1*>(out_q8), num_seqs, stream);
         return;
     }
     if (use_gqa && fagqa16 && num_kv_heads > 0 && num_q_heads == num_kv_heads * 16) {
