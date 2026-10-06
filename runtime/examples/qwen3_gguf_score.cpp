@@ -53,7 +53,10 @@ int main(int argc, char** argv) {
         printf("[FAIL] legacy weight dirs are not scoreable (no config.txt reader here)\n");
         return 1;
     }
-    cfg.max_seq    = 2048;
+    // The KV is allocated for max_seq tokens and every position is fed through it, so it has to
+    // cover the whole sequence: a fixed 2048 let a longer one write past its blocks, which read as
+    // the model collapsing past 2K (Muse Glimmer: perplexity 15 -> 1,000+ beyond position 2048).
+    cfg.max_seq    = std::max(2048, argc - 3 + 16);
     if (const char* e = getenv("SPARKINFER_SCORE_MAX_SEQ")) {
         int v = atoi(e);
         if (v > cfg.max_seq) cfg.max_seq = v;

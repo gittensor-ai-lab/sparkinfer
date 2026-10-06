@@ -5,6 +5,23 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+### Performance
+
+- **Muse Glimmer takes an int8 KV cache by default.** It was held on bf16 after #779 (garbage from
+  the first decode token), whose cause -- the int8 pool receiving bf16 writes -- #1006 fixed; the
+  carve-out outlived it and halved the pool. Teacher-forced over 6,200 tokens of real text,
+  perplexity 15.365 bf16 against 15.368 int8 (top-1 0.4589 / 0.4591). The pool now holds 72K
+  tokens instead of 33K at `--ctx 32768`. AIPerf (reasoning counted), output tok/s bf16 -> int8:
+  chat c4 / c16 / c32 280 / 692 / 761 -> 274 / 663 / 838; 8K prompts c4 / c16 110 / 112 -> 196 /
+  281, TTFT p50 at 8K c16 30.7 -> 9.7 s. llama.cpp `436f6f8` on the same GGUF: 189 / 363 / 411,
+  89 / 76. `SPARKINFER_KV_INT8=0` keeps bf16.
+
+### Fixed
+
+- **`qwen3_gguf_score` sizes its KV for the sequence it is given.** It allocated 2,048 tokens
+  unless `SPARKINFER_SCORE_MAX_SEQ` was set, so a longer sequence wrote past its blocks and read
+  as a model failing past 2K (Muse Glimmer: perplexity 15 -> 1,000+ beyond position 2048).
+
 ## [0.6.30] — 2026-10-06
 
 **Speculative decoding now runs in fixed-length benchmarks: a request with `ignore_eos` speculates.

@@ -284,19 +284,13 @@ bool ModelEngine::load(const std::string& gguf_path, int max_seq) {
     kvc.head_dim = impl_->cfg.head_dim;
     kvc.block_size = 16;
     { const char* e = getenv("SPARKINFER_KV_INT8");
-      // Muse Glimmer: int8 KV cache is a confirmed correctness bug, not a precision tradeoff --
-      // incoherent output from the very first decode token (#779), root-caused to its per-layer
-      // sliding-window/NoPE alternation + sandwich-norm activations not matching what the int8
-      // quantize/dequantize kernels were tuned against (Qwen3.6, same cfg.hybrid=true, is
-      // unaffected). The CLI tools never caught this because their short eval prompts (<4096
-      // tokens) always fell under the bf16 threshold below; the server activates int8 off its
-      // configured max_seq (there's no per-request length at KV-pool-init time), and the default
-      // max_seq (4096) satisfies ">=4096" unconditionally, so every default-config Muse Glimmer
-      // server silently served garbage. Default to bf16 until the kernel bug itself is fixed;
-      // SPARKINFER_KV_INT8=1 still force-enables it for anyone debugging that fix.
+      // Muse Glimmer was held on bf16 KV after #779 (garbage from the first decode token). The cause
+      // was the int8 pool receiving bf16 writes, fixed in #1006; the carve-out outlived it and kept
+      // Muse's pool at half the tokens. Measured on Muse Glimmer 30B Q4_K_M, 6,200 tokens of real
+      // text teacher-forced (qwen3_gguf_score, SPARKINFER_SCORE_MAX_SEQ=8192): perplexity 15.365
+      // bf16 against 15.368 int8, top-1 0.4589 / 0.4591. SPARKINFER_KV_INT8=0 keeps bf16.
       kvc.int8_kv = e ? (e[0] != '0')
-                      : (impl_->cfg.muse_glimmer ? false
-                         : impl_->cfg.hybrid ? (impl_->cfg.max_seq >= 4096) : true); }
+                      : (impl_->cfg.hybrid ? (impl_->cfg.max_seq >= 4096) : true); }
     // Only the full-attention layers get a pool slot. The Gated-DeltaNet layers of a hybrid model
     // carry a recurrent state and never read paged KV, so a slot for them is pure waste -- on
     // Qwen3.8-27B that is 16 slots of 64, i.e. the pool was 4x larger than the model can use.
