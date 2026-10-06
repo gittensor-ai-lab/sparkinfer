@@ -25,7 +25,7 @@ run() {  # arm port
         aiperf_cell "$OUT" "$1_c$c" "$2" "$TOK" "$c" "${UNIQ:+$(( 500 + c ))}" "${data[@]}" \
             --output-tokens-mean 256 --output-tokens-stddev 0 \
             --extra-inputs ignore_eos:true --extra-inputs max_tokens:256 \
-            --extra-inputs temperature:0.7 --extra-inputs top_p:0.95 --extra-inputs top_k:20
+            --extra-inputs temperature:0.7 --extra-inputs top_p:0.95 --extra-inputs top_k:20 $AIP_EXTRA
     done
 }
 
