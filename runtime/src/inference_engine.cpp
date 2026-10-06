@@ -1582,11 +1582,24 @@ void ContinuousBatchEngine::worker_loop() {
             // Nothing decodes yet and a small load is still being submitted: give the requests
             // already inside complete_streaming a moment (bounded) to land, so the scheduler sees
             // the whole load at once and they are prefilled together.
+            //
+            // A wide burst waits the same way. Without it the first schedule() saw whichever of
+            // the burst's callers had landed -- one, or twenty-seven -- and the rest queued behind
+            // a decode step and went through mixed steps of 1024 prompt tokens each: Bonsai-2 at
+            // c32 landed in one of three wall-clock modes run to run (2,230 / 2,330 / 2,460 tok/s,
+            // 9 / 5 / 1 mixed steps). Waiting is only ever while nothing decodes, so steady state
+            // and later arrivals are untouched. SPARKINFER_CB_START_WAIT_WIDE=0 keeps the wait to
+            // a quarter of the packed width.
+            static const bool start_wait_wide = [] {
+                const char* e = getenv("SPARKINFER_CB_START_WAIT_WIDE");
+                return !(e && e[0] == '0');
+            }();
             int arriving = submitting_.load(std::memory_order_acquire);
             if (arriving > 0) {
                 int pending = 0, decoding = 0;
                 for (const auto& s : active) (s.phase == SeqPhase::PREFILL ? pending : decoding)++;
-                if (decoding == 0 && pending >= 1 && (pending + arriving) * 4 <= packed_decode_width_cb()) {
+                if (decoding == 0 && pending >= 1 &&
+                    (start_wait_wide || (pending + arriving) * 4 <= packed_decode_width_cb())) {
                     cv_.wait_for(lock, std::chrono::milliseconds(2), [&] {
                         return submitting_.load(std::memory_order_acquire) == 0;
                     });
