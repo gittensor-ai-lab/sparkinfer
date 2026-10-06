@@ -50,6 +50,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 
 namespace sparkinfer {
@@ -300,6 +301,69 @@ bool& muse_stream_cache_packed_seen() {
     return seen;
 }
 
+// Ternary-Bonsai-2's long-prompt legs, kept as NVFP4. Past the fused GEMM's M limit every ternary
+// leg -- the FFN's gate, up and down, the GDN in- and out-projections, attention q|gate, k, v and
+// o -- runs as a block-scaled GEMM on an NVFP4 copy that launch_ptq1_rows_nvfp4 converts into
+// scratch first, every layer of every pass: 13.7 GB written per pass, ~17 ms, 5% of a 4096-token
+// prompt. The model cannot hold that copy at load (a 32k pass's arena needs the room), but between
+// shorter passes the room is free, so -- MuseStreamCache's rule -- the legs are converted once at
+// the end of a pass, kept beside it, read by every later pass of the same or a smaller size, and
+// released before a larger or packed pass can grow into them. A kept leg is the bytes the
+// conversion writes, so a pass that reads it runs exactly the arithmetic it would have run.
+//
+// Held, the long path also wins below the limit: at 256 / 384 / 512 tokens it measured 10394 /
+// 11404 / 12043 pp against the fused short path's 8484 / 9305 / 9584 (equal at 128), because the
+// short path decodes every weight block once per 128-row M tile and these do not. So a pass of at
+// least SPARKINFER_PREFILL_TERNARY_NVFP4_KEEP_MIN_ROWS (192) tokens that the kept legs cover takes
+// the long path (see the max_m override below) once the kept legs are at least 3/4 of the bytes:
+// a leg not kept is converted as before, and past that share the conversions it leaves cost less
+// than the short path's repeated decode (break-even is ~2/3 at 256 tokens, ~1/3 at 512).
+struct BonsaiFp4Cache {
+    struct Leg { unsigned char* d; unsigned char* sf; int rows, k; };
+    unsigned char* base = nullptr;
+    std::unordered_map<const void*, Leg> legs;   // keyed by the ternary source weight
+    int n_at = 0;                                // the largest pass size it was sized beside
+    const void* key = nullptr;                   // model identity
+    bool covered = false;                        // the kept legs are >= 3/4 of the long path's bytes
+    const Leg* find(const void* w, int rows, int k) const {
+        if (!base) return nullptr;
+        const auto it = legs.find(w);
+        return (it != legs.end() && it->second.rows == rows && it->second.k == k) ? &it->second
+                                                                                   : nullptr;
+    }
+    void release() {
+        if (!base) return;
+        cudaFree(base);
+        base = nullptr; legs.clear(); n_at = 0; key = nullptr; covered = false;
+        // A captured prefill graph may read these legs; it must not replay.
+        kernels::note_prefill_scratch_moved();
+    }
+};
+BonsaiFp4Cache& bonsai_fp4_cache() {
+    static BonsaiFp4Cache c;
+    return c;
+}
+// SPARKINFER_PREFILL_TERNARY_NVFP4_KEEP=0 converts every pass, as before (A/B in one binary).
+bool bonsai_fp4_keep_on() {
+    static const bool on = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_TERNARY_NVFP4_KEEP");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+int bonsai_fp4_keep_min_rows() {
+    static const int v = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_TERNARY_NVFP4_KEEP_MIN_ROWS");
+        return e ? atoi(e) : 192;
+    }();
+    return v;
+}
+// Clears this thread's max_m override when the pass that set it returns, whichever way it does.
+struct QbMaxOverride {
+    bool on = false;
+    ~QbMaxOverride() { if (on) kernels::pf_dense_gemm_qi8_max_m_override(0); }
+};
+
 struct VerifyGraphCache {
     Arena arena;
     cudaGraph_t graph[kVerifyMaxRows + 1] = {};
@@ -340,6 +404,15 @@ void dflash_release_verify_cache() {
 // Set by prefill_batched_chunked while a windowed prompt has windows still to run.
 static thread_local bool g_pf_hold_arena = false;
 void prefill_hold_arena(bool hold) { g_pf_hold_arena = hold; }
+
+bool prefill_release_ternary_fp4_keep() {
+    BonsaiFp4Cache& bc = bonsai_fp4_cache();
+    if (!bc.base) return false;
+    cudaDeviceSynchronize();   // a pass in flight may still be reading the legs
+    bc.release();
+    fprintf(stderr, "[prefill-bonsai] kept NVFP4 legs released: the VRAM is needed\n");
+    return true;
+}
 
 int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                         int pos0) {
@@ -766,6 +839,21 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     {
         MuseStreamCache& sc = muse_stream_cache();
         if (sc.base && (multi || N > sc.n_at || sc.key != (const void*)s.w.lm_head)) sc.release();
+        BonsaiFp4Cache& bc = bonsai_fp4_cache();
+        if (bc.base && (multi || N > bc.n_at || bc.key != (const void*)s.w.lm_head)) bc.release();
+    }
+    // A short pass the kept NVFP4 legs cover takes the long path (BonsaiFp4Cache): the fused GEMM's
+    // limit drops below N for this pass on this thread, which is what
+    // SPARKINFER_PREFILL_QB_MAX_M does for every pass, so every arm switches together.
+    QbMaxOverride qb_override;
+    {
+        const BonsaiFp4Cache& bc = bonsai_fp4_cache();
+        const int lo = bonsai_fp4_keep_min_rows();
+        if (bc.base && bc.covered && !multi && lo > 64 && N >= lo &&
+            N <= kernels::pf_dense_gemm_qi8_max_m()) {
+            kernels::pf_dense_gemm_qi8_max_m_override(64);
+            qb_override.on = true;
+        }
     }
     pf_vram("entry");
     bf16* x    = a.alloc<bf16>((size_t)N * H);
@@ -2286,6 +2374,16 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         f4_A = A; f4_sign = sign; f4_K = K;
         return true;
     };
+    // A ternary leg's NVFP4 operand: the kept copy where BonsaiFp4Cache holds it (d and sf then
+    // point there), else converted into the scratch d and sf already point at.
+    auto fp4_leg = [&](const void* W, int rows, int k, void** d, void** sf) -> bool {
+        if (const BonsaiFp4Cache::Leg* kept = bonsai_fp4_cache().find(W, rows, k)) {
+            *d = kept->d;
+            *sf = kept->sf;
+            return true;
+        }
+        return kernels::launch_ptq1_rows_nvfp4(W, *d, nullptr, rows, k, st, *sf);
+    };
     // One leg on tfp4_act's operand: C = A @ W^T (resid: C += it). False, before writing C, only
     // where the leg's shape does not fit; the caller then runs its int8 legs.
     auto tfp4_gemm = [&](const void* W, int n_out, bf16* C, bool resid) -> bool {
@@ -2296,7 +2394,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             (N8 < N && (size_t)8 * n_out > maxw))
             return false;
         const float alpha = kernels::ptq1_nvfp4_alpha();
-        kernels::launch_ptq1_rows_nvfp4(W, wd, nullptr, n_out, K, st, wl);
+        fp4_leg(W, n_out, K, &wd, &wl);
         const size_t a_main = fp4_parts(A_i8, N8, K, &ad, &ar, &al, false);
         kernels::launch_prefill_nvfp4_gemm(ad, al, wd, wl, C, N8, n_out, K, nullptr, st, alpha,
                                            resid ? C : nullptr);
@@ -3634,9 +3732,9 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     return fp4_parts(A_i8, fc8, ffn, &d, &r, &f, false) <= a_i8_sz &&
                            fp4_parts(A_i8, fc8, H, &d, &r, &f, false) <= a_i8_sz;
                 }() &&
-                kernels::launch_ptq1_rows_nvfp4(gate_pf, tg_d, nullptr, ffn, H, st, tg_s) &&
-                kernels::launch_ptq1_rows_nvfp4(up_pf, tu_d, nullptr, ffn, H, st, tu_s) &&
-                kernels::launch_ptq1_rows_nvfp4(tl->down_q, td_d, nullptr, H, ffn, st, td_s);
+                fp4_leg(gate_pf, ffn, H, &tg_d, &tg_s) &&
+                fp4_leg(up_pf, ffn, H, &tu_d, &tu_s) &&
+                fp4_leg(tl->down_q, H, ffn, &td_d, &td_s);
             if (ffn_i8 && !ffn_qi8 && !tfp4) {
                 if (t_gu) {
                     kernels::launch_ptq1_rows_i8(gate_pf, ffn_Wg_i8, ffn_swg, ffn, H, st);
@@ -4975,6 +5073,107 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         }
     }
 
+    // Keep the ternary legs as NVFP4 (BonsaiFp4Cache) beside this pass, on MuseStreamCache's
+    // terms: once the pass holds its arena at full size, as many legs, in layer order, as the free
+    // VRAM takes beside SPARKINFER_PREFILL_TERNARY_NVFP4_KEEP_MB (1024) of headroom, for passes of
+    // KEEP_MIN_ROWS (192) to KEEP_MAXN (4096) tokens. Each is converted exactly as the long path
+    // converts it, from the same source, so the bytes are the ones it would have written.
+    {
+        static const int bk_maxn = [] {
+            const char* e = getenv("SPARKINFER_PREFILL_TERNARY_NVFP4_KEEP_MAXN");
+            return e ? atoi(e) : 4096;
+        }();
+        static const long long bk_keep_mb = [] {
+            const char* e = getenv("SPARKINFER_PREFILL_TERNARY_NVFP4_KEEP_MB");
+            const long long v = e ? atoll(e) : 1024;
+            return v < 0 ? 0 : v;
+        }();
+        // Only when the pass before this one was a lone prompt too: prompts arriving one at a time
+        // is the pattern the kept legs pay for. A process's first prompt (a bench's warm-up before
+        // its burst) and a prompt that follows a packed pass leave nothing behind for the sessions
+        // around them to fail on.
+        static bool bk_prev_single = false;
+        const bool again = !multi && bk_prev_single;
+        bk_prev_single = !multi;
+        BonsaiFp4Cache& bc = bonsai_fp4_cache();
+        if (bonsai_fp4_keep_on() && again && !bc.base && !muse_stream_cache_packed_seen() &&
+            !c.muse_glimmer && s.bonsai_pf_layers && s.bonsai_sign_hidden &&
+            N >= bonsai_fp4_keep_min_rows() && N <= bk_maxn) {
+            struct Src { const void* w; int rows, k; };
+            std::vector<Src> src;
+            auto add = [&](const void* w, int type, int rows, int k) {
+                if (w && type == kPtq1GgmlType && rows > 0 && k > 0 && !(rows % 128) && !(k % 128))
+                    src.push_back({w, rows, k});
+            };
+            // The long path's legs and shapes: the FFN's gate/up from the layer (its prefill copy
+            // where it has one), down and every projection from the decode shadow.
+            for (int L = 0; L < c.n_layers; ++L) {
+                const Qwen35LayerWeights& w = s.w.layers[L];
+                const Qwen35LayerWeights& t = s.bonsai_pf_layers[L];
+                add(w.prefill_gate_q ? w.prefill_gate_q : w.gate_q,
+                    w.prefill_gate_q ? w.prefill_gate_qtype : w.gate_qtype, ffn, H);
+                add(w.prefill_up_q ? w.prefill_up_q : w.up_q,
+                    w.prefill_up_q ? w.prefill_up_qtype : w.up_qtype, ffn, H);
+                add(t.down_q, t.down_qtype, H, ffn);
+                if (w.linear_attn) {
+                    add(t.wqkv, t.wqkv_type, lqkv, H);
+                    add(t.wqkv_gate, t.wqkv_gate_type, lvdim, H);
+                    add(t.ssm_out, t.ssm_out_type, H, lvdim);
+                } else {
+                    add(t.wq, t.wq_type, wide, H);
+                    add(t.wk, t.wk_type, kvdim, H);
+                    add(t.wv, t.wv_type, kvdim, H);
+                    add(t.wo, t.wo_type, H, qdim);
+                }
+            }
+            auto al = [](size_t b) { return (b + 255) & ~(size_t)255; };
+            auto data_b = [&](const Src& x) { return al(kernels::prefill_nvfp4_data_bytes(x.rows, x.k)); };
+            auto slot_b = [&](const Src& x) {
+                return data_b(x) + al(kernels::prefill_nvfp4_scale_bytes_b(x.rows, x.k));
+            };
+            size_t total = 0;
+            for (const Src& x : src) total += slot_b(x);
+            size_t freeb = 0, totalb = 0, budget = 0;
+            const size_t keep = (size_t)bk_keep_mb << 20;
+            if (cudaMemGetInfo(&freeb, &totalb) == cudaSuccess && freeb > keep) budget = freeb - keep;
+            size_t n = 0, bytes = 0;
+            while (n < src.size() && bytes + slot_b(src[n]) <= budget) bytes += slot_b(src[n++]);
+            while (n > 0 && cudaMalloc(reinterpret_cast<void**>(&bc.base), bytes) != cudaSuccess) {
+                cudaGetLastError();
+                bc.base = nullptr;
+                n = n * 3 / 4;
+                bytes = 0;
+                for (size_t i = 0; i < n; ++i) bytes += slot_b(src[i]);
+            }
+            if (bc.base) {
+                unsigned char* p = bc.base;
+                size_t held = 0;
+                for (size_t i = 0; i < n; ++i) {
+                    BonsaiFp4Cache::Leg leg{p, p + data_b(src[i]), src[i].rows, src[i].k};
+                    if (!kernels::launch_ptq1_rows_nvfp4(src[i].w, leg.d, nullptr, leg.rows, leg.k,
+                                                         st, leg.sf))
+                        break;
+                    bc.legs[src[i].w] = leg;
+                    held += slot_b(src[i]);
+                    p += slot_b(src[i]);
+                }
+                pf_cu(cudaStreamSynchronize(st), "bonsai fp4 keep fill");
+                if (bc.legs.empty()) {
+                    cudaFree(bc.base);
+                    bc.base = nullptr;
+                } else {
+                    bc.n_at = N;
+                    bc.key = s.w.lm_head;
+                    bc.covered = held * 4 >= total * 3;
+                    fprintf(stderr, "[prefill-bonsai] kept NVFP4 legs %zu/%zu (%.0f of %.0f MB) "
+                            "beside a %d-token pass\n", bc.legs.size(), src.size(),
+                            held / 1048576.0, total / 1048576.0, N);
+                    kernels::note_prefill_scratch_moved();
+                }
+            }
+        }
+    }
+
     int seed = *s.h_out_id;
 
     // Release rather than hold when this call's scratch is too big to keep resident -- unless
@@ -5192,6 +5391,9 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
         muse_stream_cache_packed_seen() = true;
         muse_stream_cache().release();
     }
+    // A wide verify grows its own arena and graph pools with the batch: the kept NVFP4 legs give
+    // way first.
+    if (wide) bonsai_fp4_cache().release();
     const int H = c.hidden, N = n, qdim = s.qdim, kvdim = s.kvdim;
     // Every block-scaled GEMM arm below used to require `(N & 7) == 0`, because
     // launch_prefill_nvfp4_quant_a builds the A-side scale layout in groups of eight rows. The

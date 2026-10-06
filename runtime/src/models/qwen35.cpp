@@ -4038,8 +4038,12 @@ static bool restore_draft_with_room(Impl& s) {
         return (size_t)(mb < 0 ? 0 : mb) << 20;
     }();
     size_t fb = 0, tb = 0;
-    if (cudaMemGetInfo(&fb, &tb) != cudaSuccess || fb < s.dflash_draft->footprint_bytes() + headroom)
-        return false;
+    if (cudaMemGetInfo(&fb, &tb) != cudaSuccess || fb < s.dflash_draft->footprint_bytes() + headroom) {
+        // The ternary legs batched prefill keeps as NVFP4 are a cache a later pass rebuilds.
+        if (!prefill_release_ternary_fp4_keep() || cudaMemGetInfo(&fb, &tb) != cudaSuccess ||
+            fb < s.dflash_draft->footprint_bytes() + headroom)
+            return false;
+    }
     return s.dflash_draft->restore();
 }
 
@@ -4066,6 +4070,9 @@ template <class Impl>
 static bool release_bonsai_shadow(Impl& s) {
     if (s.bonsai_dec_bufs.empty()) return false;
     cudaGetLastError();   // clear the failed cudaMalloc that brought us here
+    // Batched prefill's kept NVFP4 legs were converted from these buffers and are looked up by
+    // their addresses, which a later allocation may reuse: they go with them.
+    prefill_release_ternary_fp4_keep();
     cudaDeviceSynchronize();
     if (s.graph_ready) {
         cudaGraphExecDestroy(s.cu_exec); cudaGraphDestroy(s.cu_graph);
@@ -4290,6 +4297,11 @@ int Qwen35Model::prefill_batched(const int* prompt_ids, int n, bool want_seed_lo
     bool scratch_oom = false;
     ctx.scratch_oom_out = &scratch_oom;
     int seed = prefill_batched_run(ctx, prompt_ids, n, pos0);
+    // The kept NVFP4 legs first: a later pass rebuilds them, and the shadow costs decode its speed.
+    if (seed < 0 && scratch_oom && prefill_release_ternary_fp4_keep()) {
+        scratch_oom = false;
+        seed = prefill_batched_run(ctx, prompt_ids, n, pos0);
+    }
     if (seed < 0 && scratch_oom && release_bonsai_shadow(s)) {
         scratch_oom = false;
         ctx.bonsai_pf_layers = nullptr;   // freed with the shadow: the retry reads the folded legs
@@ -4755,12 +4767,14 @@ uint64_t Qwen35Model::open_session(int num_tokens, bool* alloc_failed,
         if (buf.lin_state) cudaFree(buf.lin_state);
         if (buf.lin_conv_state) cudaFree(buf.lin_conv_state);
         buf = SessionBuffers{};
+        // Batched prefill's kept NVFP4 legs first: a cache the next pass of that size rebuilds.
+        if (attempt == 0 && prefill_release_ternary_fp4_keep()) continue;
         // The decode shadow is a cache of weights decode can also read folded: a request that
         // cannot get its state takes the shadow's VRAM, once, rather than failing.
-        if (attempt == 0 && release_bonsai_shadow(s)) continue;
+        if (attempt <= 1 && release_bonsai_shadow(s)) continue;
         // An idle draft next: it comes back when speculation resumes; the head below does not.
-        if (attempt <= 1 && offload_idle_draft(s, "a session's state")) continue;
-        if (attempt <= 2 && (s.lm_head_fp4_payload || s.lm_head_fp4_sf_buf)) {
+        if (attempt <= 2 && offload_idle_draft(s, "a session's state")) continue;
+        if (attempt <= 3 && (s.lm_head_fp4_payload || s.lm_head_fp4_sf_buf)) {
             fprintf(stderr, "[compressed-tensors] NVFP4 lm_head released for a session's state\n");
             release_lm_head_fp4();
             continue;

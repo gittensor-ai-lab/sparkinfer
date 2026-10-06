@@ -45,6 +45,10 @@ bool pf_dense_gemm_qi8_supported(int ggml_type);
 // Largest M the fused quantized-B GEMM accepts (SPARKINFER_PREFILL_QB_MAX_M, default 512). Past it
 // the launcher declines, so a caller that would give up a better path to try it can check first.
 int pf_dense_gemm_qi8_max_m();
+// This thread's override of that limit, for one pass (0 clears it): a caller that holds every
+// weight the longer path needs already converted can send a short pass down that path, exactly as
+// SPARKINFER_PREFILL_QB_MAX_M would, without moving it for anyone else.
+void pf_dense_gemm_qi8_max_m_override(int m);
 
 // Dense (non-routed) fused-decode int8 GEMM: C[M,N] = A_i8[M,K] @ dequant(W_q[N,K])^T, reading the
 // weight in native Q4_K/Q5_K and decoding it to int8 inside the B-stage using a per-output-row

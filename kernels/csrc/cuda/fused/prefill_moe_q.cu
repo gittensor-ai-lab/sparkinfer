@@ -2208,15 +2208,17 @@ bool pf_dense_gemm_qi8_supported(int ggml_type) {
 // SPARKINFER_Q38_PREFILL_QB=0) is +21.8% at prefill@16k but -16.1% at prefill@128 -- the threshold
 // is what keeps both.
 // SPARKINFER_PREFILL_QB_MAX_M=0 disables the cap (restores the old always-fused behaviour).
+static thread_local int t_qb_max_m = 0;   // pf_dense_gemm_qi8_max_m_override
 static int qb_max_m() {
     static const int v = [] {
         const char* e = getenv("SPARKINFER_PREFILL_QB_MAX_M");
         const int x = e ? atoi(e) : 512;
         return x > 0 ? x : (1 << 30);
     }();
-    return v;
+    return t_qb_max_m > 0 ? t_qb_max_m : v;
 }
 int pf_dense_gemm_qi8_max_m() { return qb_max_m(); }
+void pf_dense_gemm_qi8_max_m_override(int m) { t_qb_max_m = m > 0 ? m : 0; }
 
 bool launch_pfm_moe_gemm_qi8(int ggml_type, const signed char* A_i8, const float* sx,
                              const void* W_q, const float* row_scale,

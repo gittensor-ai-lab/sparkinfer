@@ -274,6 +274,11 @@ struct Qwen35PrefillCtx {
     int*                 mix_out          = nullptr;   // [mix_n] host argmax, filled when the pass returns
 };
 
+// Free the ternary legs batched prefill keeps as NVFP4 between passes (they are rebuilt by a later
+// pass). Returns whether anything was held. For a caller about to fail an allocation, and for one
+// about to free the decode shadow the kept legs were converted from.
+bool prefill_release_ternary_fp4_keep();
+
 // Fill the paged KV cache + Gated-DeltaNet state for positions 0..n-1 in one batched pass.
 // Returns the argmax at the last prompt position (seed for the first decode step), or -1 if the
 // batched path is unsupported for this model/config (caller falls back to the token loop).
