@@ -5,6 +5,12 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+## [0.6.32] — 2026-10-06
+
+**Muse Glimmer at 16 concurrent 8K prompts: 351 tok/s and a 2.5 s first token (was 281 / 9.7 s),
+against llama.cpp's 76 / 7.9 s. sparkinfer now leads llama.cpp on every measured Muse Glimmer
+axis, including 32K-120K prompts (first token 3.6-4.2x sooner).**
+
 ### Performance
 
 - **Muse Glimmer's KV pool grows into 4 GiB of headroom instead of 6.** The extra 2 GiB went to the
