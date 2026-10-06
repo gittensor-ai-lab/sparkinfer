@@ -6981,7 +6981,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 // drifts from AR at long context (#712). start_pos + N is the largest row
                 // length in this batch, matching what AR would report at the last row.
                 1.f / sqrtf((float)c.head_dim), st, nullptr, per_row ? packed_seq_hint : start_pos + N,
-                ks, vs, kv8 ? 1 : 0, int8_gate_fused ? qg : nullptr);
+                ks, vs, kv8 ? 1 : 0, int8_gate_fused ? qg : nullptr, 0, per_row ? 1 : 0);
             // att/qg rows are contiguous at stride qdim, and the gate is elementwise, so one
             // launch covers the whole block. N separate nodes cost N times the graph-node
             // dependency latency for the same work.

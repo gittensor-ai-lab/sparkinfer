@@ -1736,8 +1736,32 @@ void launch_flash_decode_split(
         // (block_size==16 so each warp maps to one physical block, chunk >= 2 blocks to fill the GPU).
         static int famma256 = -1;
         if (famma256 < 0) { const char* e = getenv("SPARKINFER_FAMMA"); famma256 = (e && e[0] == '0') ? 0 : 1; }
+        // Packed rows on the int8 KV of a 6:1 group (Ternary-Bonsai-2's and Qwen3.8's 24Q/4KV
+        // full-attention layers): #1333's rule for the 16:1 hd128 group. The caller sizes the
+        // split count for one row's longest context and the MMA gate wants seqlen > 512, so rows
+        // of a few hundred tokens -- every continuous-batch step of the bench, and of any
+        // chat-length load -- ran the scalar int8 tile with each split holding a few dozen keys
+        // (Ternary-Bonsai-2 cb c32: 54.8 us a layer, 7% of the step). They now take the int8
+        // tensor-core split with 16/8/4 splits by row count and at least 32 keys a split; only the
+        // grouping of the softmax partials before the combine changes. Single-row decode, prefill
+        // and verify keep their dispatch. SPARKINFER_FAGQA6_I8ROWS=0 restores main.
+        static int fagqa6_i8rows = -1;
+        if (fagqa6_i8rows < 0) { const char* e = getenv("SPARKINFER_FAGQA6_I8ROWS"); fagqa6_i8rows = (e && e[0] == '0') ? 0 : 1; }
+        const bool rows_i8_6 = fagqa6_i8rows && famma256 && independent_rows && int8_kv &&
+                               num_seqs >= 2 && block_size == 16 && num_kv_heads > 0 &&
+                               num_q_heads == num_kv_heads * 6;
+        if (rows_i8_6) {
+            const int rows = num_seqs * num_kv_heads;
+            int ns = rows <= 8 ? 16 : rows <= 32 ? 8 : 4;
+            const int by_len = seqlen > 0 ? (seqlen + 31) / 32 : ns;   // >= 32 keys a split
+            if (ns > by_len) ns = by_len;
+            if (ns > n_splits) ns = n_splits;   // the partials are sized for n_splits
+            if (ns < 1) ns = 1;
+            n_splits = ns;                      // the split kernel's and the combine's
+        }
         const int mma_chunk256 = (n_splits > 0) ? (seqlen + n_splits - 1) / n_splits : 0;
-        const bool mma_ok256 = famma256 && seqlen > 512 && block_size == 16 && mma_chunk256 >= 32;
+        const bool mma_ok256 = rows_i8_6 ||
+                               (famma256 && seqlen > 512 && block_size == 16 && mma_chunk256 >= 32);
         static int fagqa4 = -1;
         if (fagqa4 < 0) { const char* e = getenv("SPARKINFER_FAGQA4"); fagqa4 = (e && e[0] == '0') ? 0 : 1; }
         if (fagqa4 && num_kv_heads > 0 && num_q_heads == num_kv_heads * 4) {
