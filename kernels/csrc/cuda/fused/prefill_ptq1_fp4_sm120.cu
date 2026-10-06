@@ -136,6 +136,104 @@ ptq1_rotq_fp4_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* _
     }
 }
 
+// The same operand with one WARP per (1024-span, row) instead of one CTA per row. NVFP4 scales each
+// 16-slot group alone, so nothing couples the spans of a row, and the CTA-per-row shape only walked
+// them one after another -- up to 17 spans, three block barriers each, on 128 CTAs at a 128-token
+// prefill. Lane l holds natural values [32l, 32l+32): the butterflies over index bits 0-4 run in
+// registers and bits 5-9 by shuffle, every bit ascending and each as (lo + hi, lo - hi), the stage
+// order and arithmetic of the kernel above, so the rotated values are the same floats. The slot
+// order's gather goes through the warp's own shared span (padded one float in 32 so the lanes'
+// contiguous writes miss each other's banks); a lane then owns slots [32l, 32l+32), two whole
+// groups: one 16-byte store of nibbles and one 2-byte store of scales. Output is byte-identical.
+template <bool SWIGLU>
+__global__ void __launch_bounds__(256)
+ptq1_rotq_fp4_warp_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ u,
+                          const signed char* __restrict__ sign, unsigned char* __restrict__ q,
+                          int rows, int k) {
+    constexpr int kPadSpan = kSpan + kSpan / 32;
+    __shared__ float sh[8][kPadSpan];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    const int ns = k / kSpan;
+    const long item = (long)blockIdx.x * 8 + warp;
+    if (item >= (long)rows * ns) return;
+    const int row = (int)(item / ns), sp = (int)(item - (long)row * ns);
+    const int e0 = sp * kSpan + lane * 32;
+    float r[32];
+#pragma unroll
+    for (int c = 0; c < 4; ++c) {
+        uint4 raw = *reinterpret_cast<const uint4*>(x + (size_t)row * k + e0 + c * 8);
+        if constexpr (SWIGLU) {
+            const uint4 ur = *reinterpret_cast<const uint4*>(u + (size_t)row * k + e0 + c * 8);
+            const __nv_bfloat16* gh = reinterpret_cast<const __nv_bfloat16*>(&raw);
+            const __nv_bfloat16* uh = reinterpret_cast<const __nv_bfloat16*>(&ur);
+            __nv_bfloat16 o[8];
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const float g = __bfloat162float(gh[j]);
+                o[j] = __float2bfloat16(__fdividef(g, 1.f + __expf(-g)) * __bfloat162float(uh[j]));
+            }
+            raw = *reinterpret_cast<const uint4*>(o);
+        }
+        const __nv_bfloat16* h = reinterpret_cast<const __nv_bfloat16*>(&raw);
+        const uint2 sg2 = *reinterpret_cast<const uint2*>(sign + e0 + c * 8);
+        const signed char* sg = reinterpret_cast<const signed char*>(&sg2);
+#pragma unroll
+        for (int j = 0; j < 8; ++j) r[c * 8 + j] = __bfloat162float(h[j]) * (float)sg[j];
+    }
+#pragma unroll
+    for (int len = 1; len < 32; len <<= 1)
+#pragma unroll
+        for (int j = 0; j < 32; ++j)
+            if (!(j & len)) {
+                const float a = r[j], b = r[j + len];
+                r[j] = a + b; r[j + len] = a - b;
+            }
+#pragma unroll
+    for (int m = 1; m < 32; m <<= 1) {
+        const bool hi = lane & m;
+#pragma unroll
+        for (int j = 0; j < 32; ++j) {
+            const float p = __shfl_xor_sync(0xffffffffu, r[j], m);
+            r[j] = hi ? p - r[j] : r[j] + p;
+        }
+    }
+    float* s = sh[warp];
+#pragma unroll
+    for (int j = 0; j < 32; ++j) s[lane * 33 + j] = r[j];
+    __syncwarp();
+    unsigned nib[4];
+    unsigned sfb[2];
+#pragma unroll
+    for (int g = 0; g < 2; ++g) {
+        float v[16];
+        float ga = 0.f;
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            const int slot = lane * 32 + g * 16 + j;
+            const int nat = (slot & ~(kBlk - 1)) + fp4_perm(slot & (kBlk - 1));
+            v[j] = s[nat + (nat >> 5)] * 0.03125f;
+            ga = fmaxf(ga, fabsf(v[j]));
+        }
+        const __nv_fp8_storage_t qb =
+            __nv_cvt_float_to_fp8(fmaxf(ga * (1.f / 6.f), 0x1p-9f), __NV_SATFINITE, __NV_E4M3);
+        const float rq = __frcp_rn(__half2float(__half(__nv_cvt_fp8_to_halfraw(qb, __NV_E4M3))));
+        sfb[g] = qb;
+#pragma unroll
+        for (int w = 0; w < 4; ++w) {
+            const unsigned lo = __nv_cvt_float2_to_fp4x2(
+                make_float2(v[4 * w] * rq, v[4 * w + 1] * rq), __NV_E2M1, cudaRoundNearest);
+            const unsigned hi = __nv_cvt_float2_to_fp4x2(
+                make_float2(v[4 * w + 2] * rq, v[4 * w + 3] * rq), __NV_E2M1, cudaRoundNearest);
+            if (w & 1) nib[g * 2 + (w >> 1)] |= (lo | (hi << 8)) << 16;
+            else       nib[g * 2 + (w >> 1)] = lo | (hi << 8);
+        }
+    }
+    *reinterpret_cast<uint4*>(q + (size_t)row * (k / 2) + e0 / 2) =
+        make_uint4(nib[0], nib[1], nib[2], nib[3]);
+    *reinterpret_cast<unsigned short*>(q + (size_t)rows * (k / 2) + (size_t)row * (k / 16) + e0 / 16) =
+        (unsigned short)(sfb[0] | (sfb[1] << 8));
+}
+
 // ---- weights: trits -> e2m1 -------------------------------------------------------------------
 // s * 2^10 -> (e2m1 code of the magnitude m, ue4m3 sf) with m * sf nearest it. The checkpoint's
 // scales (2.7e-3 .. 0.16) put s * 2^10 at 2.8 .. 164, where every ue4m3 is normal, so m = 2, 4
@@ -604,6 +702,21 @@ bool launch_ptq1_rotq_fp4(const void* x_bf16, const void* up_bf16, const signed 
         return false;
     const auto* x = static_cast<const __nv_bfloat16*>(x_bf16);
     auto* q = static_cast<unsigned char*>(a);
+    // Warp per (span, row), byte-identical output. SPARKINFER_PREFILL_FP4_ROTQ_WARP=0 restores the
+    // CTA-per-row kernel (A/B in one binary).
+    static const bool warp = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_FP4_ROTQ_WARP");
+        return !(e && e[0] == '0');
+    }();
+    if (warp) {
+        const unsigned grid = (unsigned)(((long)rows * (k / kSpan) + 7) / 8);
+        if (up_bf16)
+            ptq1_rotq_fp4_warp_kernel<true><<<grid, 256, 0, st>>>(
+                x, static_cast<const __nv_bfloat16*>(up_bf16), sign, q, rows, k);
+        else
+            ptq1_rotq_fp4_warp_kernel<false><<<grid, 256, 0, st>>>(x, nullptr, sign, q, rows, k);
+        return cudaPeekAtLastError() == cudaSuccess;
+    }
     if (up_bf16)
         ptq1_rotq_fp4_kernel<true><<<rows, 256, 0, st>>>(
             x, static_cast<const __nv_bfloat16*>(up_bf16), sign, q, rows, k);
