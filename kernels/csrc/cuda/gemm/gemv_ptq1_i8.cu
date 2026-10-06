@@ -55,6 +55,24 @@ __device__ __forceinline__ size_t sf_cutlass_off(int r, int g, int ng) {
     return ((size_t)(r >> 7) * (size_t)(ng >> 2) + (size_t)(g >> 2)) * 512 +
            (size_t)((r & 31) * 16 + ((r >> 5) & 3) * 4 + (g & 3));
 }
+// e2m1 code of v, nearest-even, saturating at 6, sign kept (-0 and a negative underflow give 8, a
+// NaN gives +6): what __nv_cvt_float2_to_fp4x2(.., __NV_E2M1, cudaRoundNearest) returns for each
+// half. That intrinsic is one cvt only on an arch-specific target (sm_120a, as si_nvfp4 builds);
+// this file builds for plain sm_120 with the rest of si_gemm, where cuda_fp4.hpp widens every
+// value to double and rounds it in software -- FP64 at 1/64 rate on a GeForce part, and the
+// long-prompt FP4 activation below converts every value of every leg. The thresholds are e2m1's
+// midpoints (0.25 .. 5), each tie going to the even code, so the codes are the intrinsic's.
+__device__ __forceinline__ unsigned e2m1_rn(float v) {
+    const float a = fabsf(v);
+    if (a != a) return 7u;
+    const unsigned c = a <= 0.25f ? 0u : a < 0.75f ? 1u : a <= 1.25f ? 2u : a < 1.75f ? 3u
+                     : a <= 2.5f  ? 4u : a < 3.5f  ? 5u : a <= 5.f   ? 6u : 7u;
+    return c | ((__float_as_uint(v) >> 28) & 8u);
+}
+// The pair packed as the intrinsic packs it: x in the low nibble, y in the high one.
+__device__ __forceinline__ unsigned e2m1x2_rn(float x, float y) {
+    return e2m1_rn(x) | (e2m1_rn(y) << 4);
+}
 
 // ---------------------------------------------------------------------------------------------
 // Rotate + quantize. One CTA per (1024-span, row), 256 threads holding four consecutive values
@@ -1167,10 +1185,8 @@ ptq1_rotq_rows_i8_kernel(const __nv_bfloat16* __restrict__ x, const signed char*
                     __nv_cvt_float_to_fp8(fmaxf(ga * (1.f / 6.f), 0x1p-9f), __NV_SATFINITE, __NV_E4M3);
                 const float qs = __half2float(__half(__nv_cvt_fp8_to_halfraw(qb, __NV_E4M3)));
                 const int e0 = sp * kSpan + t * 4;
-                const unsigned lo = __nv_cvt_float2_to_fp4x2(
-                    make_float2(v[sp][0] / qs, v[sp][1] / qs), __NV_E2M1, cudaRoundNearest);
-                const unsigned hi = __nv_cvt_float2_to_fp4x2(
-                    make_float2(v[sp][2] / qs, v[sp][3] / qs), __NV_E2M1, cudaRoundNearest);
+                const unsigned lo = e2m1x2_rn(v[sp][0] / qs, v[sp][1] / qs);
+                const unsigned hi = e2m1x2_rn(v[sp][2] / qs, v[sp][3] / qs);
                 *reinterpret_cast<unsigned short*>(
                     reinterpret_cast<unsigned char*>(q) + ((size_t)row * k + e0) / 2) =
                     (unsigned short)(lo | (hi << 8));
@@ -1226,6 +1242,12 @@ __device__ __forceinline__ void ptq1_fp4_scale(float sb, unsigned& code, unsigne
         if (e < best) { best = e; code = 2u + (unsigned)i; sfb = f; }
     }
 }
+// A warp stages at most kRowsChunk blocks of its row (8 KB of trits) at a time, so every width runs
+// WPC rows a CTA: a whole 17408-wide row staged at once took 17 KB a warp, and the FFN down leg
+// ran one warp a CTA at ~0.74 TB/s against the gate/up legs' ~1.34 over the same bytes. Each
+// 16-value group reads the same trits and the same block scale either way. Rows up to 8192 wide
+// are one chunk, as before.
+constexpr int kRowsChunk = 64;
 template <int WPC>
 __global__ void __launch_bounds__(WPC * 32)
 ptq1_rows_nvfp4_kernel(const unsigned char* __restrict__ w, unsigned char* __restrict__ q,
@@ -1236,32 +1258,38 @@ ptq1_rows_nvfp4_kernel(const unsigned char* __restrict__ w, unsigned char* __res
     const int row = blockIdx.x * WPC + warp;
     if (row >= rows) return;
     const unsigned char* wr = w + (size_t)row * nblk * kBlkBytes;
-    signed char* buf = reinterpret_cast<signed char*>(srow) + (size_t)warp * nblk * kBlk;
-    for (int i = lane; i < 2 * nblk; i += 32) {
-        const int b = i >> 1, h = i & 1;
-        const unsigned* bw = reinterpret_cast<const unsigned*>(wr + b * kBlkBytes);
-        const unsigned tw[4] = {__ldg(bw + 2 * h), __ldg(bw + 2 * h + 1), __ldg(bw + 4 + h),
-                                (__ldg(bw + 6) & 0xFFFFu) | 0x3C000000u};   // scale 1.0: bare trits
-        t_half(tw, h, 1.f, buf + b * kBlk);
-    }
-    __syncwarp();
+    const int cb = min(nblk, kRowsChunk);
+    signed char* buf = reinterpret_cast<signed char*>(srow) + (size_t)warp * cb * kBlk;
     const int ng = nblk * (kBlk / 16);
-    for (int g = lane; g < ng; g += 32) {
-        const int b = g >> 3;
-        const unsigned short hs = *reinterpret_cast<const unsigned short*>(wr + b * kBlkBytes + 26);
-        unsigned code; unsigned char sfb;
-        ptq1_fp4_scale(__half2float(__ushort_as_half(hs)), code, sfb);
-        const signed char* tv = buf + g * 16;
-        unsigned o[2] = {0u, 0u};
-#pragma unroll
-        for (int j = 0; j < 16; ++j) {
-            const int tr = tv[j];
-            const unsigned nib = tr == 0 ? 0u : (code | (tr < 0 ? 8u : 0u));
-            o[j >> 3] |= nib << (4 * (j & 7));
+    for (int c0 = 0; c0 < nblk; c0 += cb) {
+        const int cn = min(cb, nblk - c0);
+        if (c0) __syncwarp();   // the previous chunk's groups are read out
+        for (int i = lane; i < 2 * cn; i += 32) {
+            const int b = i >> 1, h = i & 1;
+            const unsigned* bw = reinterpret_cast<const unsigned*>(wr + (c0 + b) * kBlkBytes);
+            const unsigned tw[4] = {__ldg(bw + 2 * h), __ldg(bw + 2 * h + 1), __ldg(bw + 4 + h),
+                                    (__ldg(bw + 6) & 0xFFFFu) | 0x3C000000u};   // scale 1.0: bare trits
+            t_half(tw, h, 1.f, buf + b * kBlk);
         }
-        *reinterpret_cast<uint2*>(q + (size_t)row * nblk * (kBlk / 2) + g * 8) = make_uint2(o[0], o[1]);
-        if (sfl) sfl[sf_cutlass_off(row, g, ng)] = sfb;
-        else sf[(size_t)row * ng + g] = sfb;
+        __syncwarp();
+        for (int gc = lane; gc < cn * (kBlk / 16); gc += 32) {
+            const int g = c0 * (kBlk / 16) + gc;
+            const int b = g >> 3;
+            const unsigned short hs = *reinterpret_cast<const unsigned short*>(wr + b * kBlkBytes + 26);
+            unsigned code; unsigned char sfb;
+            ptq1_fp4_scale(__half2float(__ushort_as_half(hs)), code, sfb);
+            const signed char* tv = buf + gc * 16;
+            unsigned o[2] = {0u, 0u};
+#pragma unroll
+            for (int j = 0; j < 16; ++j) {
+                const int tr = tv[j];
+                const unsigned nib = tr == 0 ? 0u : (code | (tr < 0 ? 8u : 0u));
+                o[j >> 3] |= nib << (4 * (j & 7));
+            }
+            *reinterpret_cast<uint2*>(q + (size_t)row * nblk * (kBlk / 2) + g * 8) = make_uint2(o[0], o[1]);
+            if (sfl) sfl[sf_cutlass_off(row, g, ng)] = sfb;
+            else sf[(size_t)row * ng + g] = sfb;
+        }
     }
 }
 
@@ -1282,20 +1310,16 @@ bool launch_ptq1_rows_nvfp4(const void* w_ptq1, void* q, void* sf_rowmajor, int 
     if (!attr) {
         cudaFuncSetAttribute(ptq1_rows_nvfp4_kernel<4>,
                              cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024);
-        cudaFuncSetAttribute(ptq1_rows_nvfp4_kernel<1>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, 96 * 1024);
         attr = true;
     }
     const auto* w = static_cast<const unsigned char*>(w_ptq1);
     auto* qq = static_cast<unsigned char*>(q);
     auto* sf = static_cast<unsigned char*>(sf_rowmajor);
-    // A row stages k bytes of shared memory: four rows a CTA at the FFN's 17408 would leave one CTA
-    // on an SM, so wide rows go one to a CTA.
-    if (k > 8192)
-        ptq1_rows_nvfp4_kernel<1><<<rows, 32, (size_t)k, st>>>(w, qq, sf, rows, k / kBlk, sfl);
-    else
-        ptq1_rows_nvfp4_kernel<4><<<(rows + 3) / 4, 128, (size_t)4 * k, st>>>(w, qq, sf, rows,
-                                                                            k / kBlk, sfl);
+    // A row stages at most kRowsChunk blocks of shared memory at a time, so four rows a CTA at
+    // every width (the FFN's 17408 used to go one row to a CTA).
+    const int nblk = k / kBlk;
+    const size_t smem = (size_t)4 * (nblk < kRowsChunk ? nblk : kRowsChunk) * kBlk;
+    ptq1_rows_nvfp4_kernel<4><<<(rows + 3) / 4, 128, smem, st>>>(w, qq, sf, rows, nblk, sfl);
     return true;
 }
 float ptq1_nvfp4_alpha() { return 1.f / kFp4WScale; }
