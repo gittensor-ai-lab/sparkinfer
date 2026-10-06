@@ -67,9 +67,26 @@ same box. Output tok/s, **sparkinfer** / vLLM.
 | Qwen3.8-27B | **2.49 / 6.05 / 14.4 s** | 3.33 / 9.25 / 25.1 s |
 | Qwen3.6-35B-A3B | **1.31 / 3.33 / 8.28 s** | 1.39 / 3.67 / 9.46 s |
 
+Muse Glimmer 30B (GGUF only, so against llama.cpp `436f6f8`: `WHICH="sparkinfer llamacpp"`, the same
+UD-Q4_K_M-style file on both, `-fa on`, 32 slots), `cells.sh` with
+`AIP_EXTRA='--extra-inputs enable_thinking:true'`, sparkinfer 0.6.31:
+
+| chat c4 | chat c16 | chat c32 | 8K c4 | 8K c16 |
+|---:|---:|---:|---:|---:|
+| **274** / 189 | **663** / 363 | **838** / 411 | **196** / 89 | **281** / 76 |
+
 The 8K c16 cell moves about ±4% between runs of the same build; the others about ±2%.
 
 ## Notes
+
+- **Reasoning models.** AIPerf counts the tokens in the streamed text. sparkinfer streams a
+  model's reasoning as `reasoning_content` only when the request enables thinking (Muse Glimmer's
+  `to=self` channel is otherwise dropped), so pass `AIP_EXTRA='--extra-inputs enable_thinking:true'`
+  or the reasoning tokens are generated but not counted. llama.cpp streams them either way.
+- **Muse Glimmer's tokenizer.** The GGUF is the only release; AIPerf and the server need a
+  `tokenizer.json`. Build one from the GGUF's own vocab and merges with the GPT-4o split regex
+  llama.cpp uses for its `llama4` pre-tokenizer (byte-level BPE); it matched llama-server's
+  `/tokenize` exactly on 5 of 5 texts up to 6,484 tokens.
 
 - vLLM needs `MAX_JOBS=4` (set in `common.sh`): flashinfer's JIT otherwise exhausts host memory on
   first start.

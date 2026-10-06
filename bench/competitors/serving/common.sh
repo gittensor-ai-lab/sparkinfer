@@ -5,6 +5,7 @@
 #   SI_BIN     sparkinfer_server binary          (default: <repo>/build/server/sparkinfer_server)
 #   AIPERF     AIPerf CLI                        (default: aiperf on PATH)
 #   VLLM       vLLM CLI                          (default: vllm on PATH)
+#   LLAMA_SERVER  llama.cpp's llama-server       (default: llama-server on PATH)
 #   OUT_ROOT   where result directories go       (default: ./results)
 #   LOCK       flock file serializing GPU runs   (default: /tmp/sparkinfer_bot.lock; empty = none)
 #   UNIQ       set to give each cell its own AIPerf seed (distinct prompts per cell; recommended)
@@ -13,10 +14,12 @@ REPO="$(cd "$HERE/../../.." && pwd)"
 SI_BIN=${SI_BIN:-$REPO/build/server/sparkinfer_server}
 AIPERF=${AIPERF:-aiperf}
 VLLM=${VLLM:-vllm}
+LLAMA_SERVER=${LLAMA_SERVER:-llama-server}
 OUT_ROOT=${OUT_ROOT:-$PWD/results}
 LOCK=${LOCK-/tmp/sparkinfer_bot.lock}
 SI_PORT=${SI_PORT:-18301}
 VL_PORT=${VL_PORT:-18303}
+LC_PORT=${LC_PORT:-18305}
 
 # One GPU job at a time: a timed-out lock aborts the run instead of overlapping two servers.
 take_lock() {
@@ -47,6 +50,15 @@ start_vllm() {
         --port "$VL_PORT" "$@" > "$log" 2>&1 &
     VP=$!
     wait_up "$VL_PORT"
+}
+
+# start_llamacpp <gguf> <total ctx> <slots> <log> [extra llama-server args...]; sets LP
+# --ctx is the KV cache shared by all slots: give it slots x the longest request.
+start_llamacpp() {
+    local m=$1 ctx=$2 np=$3 log=$4; shift 4
+    "$LLAMA_SERVER" -m "$m" -ngl 99 -fa on --jinja -np "$np" -c "$ctx" --port "$LC_PORT" "$@" > "$log" 2>&1 &
+    LP=$!
+    wait_up "$LC_PORT"
 }
 
 stop_server() {  # pid

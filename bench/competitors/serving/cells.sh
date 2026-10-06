@@ -6,6 +6,12 @@
 #
 #   SI_M=<sparkinfer model> VL_M=<vLLM model> TOK=<tokenizer dir> UNIQ=1 ./cells.sh
 #
+# A GGUF-only model runs against llama.cpp instead: WHICH="sparkinfer llamacpp" (LC_M, default SI_M;
+# 32 slots sharing LC_CTX tokens of KV, default 32 x 8,704). AIP_EXTRA adds AIPerf arguments to
+# every cell, e.g. a reasoning model whose thinking a server hides unless the request asks for it:
+#   AIP_EXTRA='--extra-inputs chat_template_kwargs:{"enable_thinking":true}'
+# (AIPerf counts the streamed text, so hidden reasoning would read as missing output.)
+#
 # More environment: WHICH ("sparkinfer vllm"), ONLYCHAT / ONLY8K, DECODE_ONLY (32 -> 256 tokens at
 # 16 / 32, pure decode), SI_EXTRA (extra server args, e.g. "--draft-model DIR"), CTX (32768).
 # See common.sh for binaries and paths.
@@ -20,7 +26,7 @@ cell() {  # engine port name isl osl c
     aiperf_cell "$OUT" "$1_$3_c$6" "$2" "$TOK" "$6" "${UNIQ:+$(( $4 * 100 + $6 ))}" \
         --synthetic-input-tokens-mean "$4" --synthetic-input-tokens-stddev 0 \
         --output-tokens-mean "$5" --output-tokens-stddev 0 \
-        --extra-inputs ignore_eos:true --extra-inputs "max_tokens:$5"
+        --extra-inputs ignore_eos:true --extra-inputs "max_tokens:$5" $AIP_EXTRA
 }
 run_load() {  # engine port
     if [ -n "$DECODE_ONLY" ]; then for c in 16 32; do cell "$1" "$2" tiny 32 256 $c; done; return; fi
@@ -37,5 +43,9 @@ if [[ $WHICH == *vllm* ]]; then
     start_vllm "$VL_M" "$CTX" "$OUT/vllm_srv.log" --gpu-memory-utilization 0.92 --max-num-seqs 64 &&
         run_load vllm "$VL_PORT"
     stop_server "$VP"
+fi
+if [[ $WHICH == *llamacpp* ]]; then
+    start_llamacpp "${LC_M:-$SI_M}" "${LC_CTX:-278528}" 32 "$OUT/llamacpp_srv.log" && run_load llamacpp "$LC_PORT"
+    stop_server "$LP"
 fi
 echo "ALLDONE $OUT"
