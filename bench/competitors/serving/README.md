@@ -69,11 +69,14 @@ same box. Output tok/s, **sparkinfer** / vLLM.
 
 Muse Glimmer 30B (GGUF only, so against llama.cpp `436f6f8`: `WHICH="sparkinfer llamacpp"`, the same
 `Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf` on both, `-fa on`, 32 slots), `cells.sh` with
-`AIP_EXTRA='--extra-inputs enable_thinking:true'`, sparkinfer 0.6.31:
+`AIP_EXTRA='--extra-inputs enable_thinking:true'`, sparkinfer 0.6.32:
 
 | chat c4 | chat c16 | chat c32 | 8K c4 | 8K c16 |
 |---:|---:|---:|---:|---:|
-| **274** / 189 | **663** / 363 | **838** / 411 | **196** / 89 | **281** / 76 |
+| **274** / 189 | **665** / 363 | **847** / 411 | **196** / 89 | **351** / 76 |
+
+`longctx.sh` on Muse Glimmer, time to first token at 32K / 64K / 120K prompts: **2.15 / 4.84 /
+10.45 s** against llama.cpp's 8.99 / 18.9 / 38.1 s.
 
 The 8K c16 cell moves about ±4% between runs of the same build; the others about ±2%.
 
