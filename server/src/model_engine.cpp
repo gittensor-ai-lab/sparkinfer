@@ -875,7 +875,12 @@ void ModelEngine::grow_kv_pool() {
     // The LMCache sidecar was handed the pool's layout at load; leave a pool it knows alone.
     if (impl_->lmcache_bridge) return;
     const char* he = getenv("SPARKINFER_KV_HEADROOM_GIB");
-    const double head_gib = he ? atof(he) : 6.0;
+    // Muse Glimmer leaves 4 GiB, not 6. Its headroom is taken by the NVFP4 down / o copies the
+    // prefill builds beside its first pass (~4.5 GB when there is room), which buy little: with 4
+    // GiB they keep 39 of 52 downs and 1 o, 8K prompts at 4 requests prefill exactly as fast (196
+    // tok/s), and the pool holds 151K tokens instead of 72K -- every request of 16 x 8K fits. AIPerf
+    // 8K prompts at 16 requests: 281 -> 351 tok/s, TTFT p50 9.7 -> 2.5 s; chat cells unchanged.
+    const double head_gib = he ? atof(he) : (impl_->cfg.muse_glimmer ? 4.0 : 6.0);
     size_t free_b = 0, total_b = 0;
     if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) return;
     const size_t head_b = (size_t)(head_gib * (double)(1ull << 30));

@@ -5,6 +5,16 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+### Performance
+
+- **Muse Glimmer's KV pool grows into 4 GiB of headroom instead of 6.** The extra 2 GiB went to the
+  NVFP4 down / o copies the prefill builds beside its first pass, which buy little here: with 4 GiB
+  it keeps 39 of 52 downs and 1 of 52 o projections and 8K prompts prefill as fast (196 tok/s at 4
+  requests), while the pool holds 151K tokens instead of 72K at `--ctx 32768`. AIPerf 8K prompts at
+  16 requests: 281 -> 351 output tok/s, TTFT p50 9.7 -> 2.5 s (llama.cpp `436f6f8` on the same GGUF:
+  76 tok/s, 7.9 s); chat at 4 / 16 / 32 requests 274 / 663 / 838 -> 274 / 665 / 847.
+  `SPARKINFER_KV_HEADROOM_GIB` still sets it for any model.
+
 ## [0.6.31] — 2026-10-06
 
 **Muse Glimmer serves 8K prompts 1.8-2.5x faster: its KV cache is int8 by default, so twice as many
