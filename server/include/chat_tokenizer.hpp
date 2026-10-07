@@ -43,6 +43,9 @@ public:
     // once after the model's architecture is known (ModelEngine::is_qwen38()), before the first
     // request. Independent of set_museglimmer -- the two are mutually exclusive model families.
     void set_qwen38(bool on);
+    // Which Qwen3.8 chat template the checkpoint ships (qwen38_template_variant()); only read
+    // while set_qwen38(true). Defaults to kQwen38Pinned.
+    void set_qwen38_template(QwenTemplateVariant variant);
 
     bool encode_chat_request(const std::string& request_json, std::vector<int>& ids, bool enable_thinking,
                              std::string& err, ChatRequest* parsed_request = nullptr) const;
@@ -184,5 +187,9 @@ std::string apply_museglimmer_chat_template(const std::vector<ChatMessage>& mess
 ParsedAssistantOutput parse_assistant_output(const std::string& raw, bool enable_thinking,
                                              bool museglimmer = false,
                                              const ChatRequest* request = nullptr);
+
+// tokenizer.json with any truncation/padding block nulled (it applies to every encode, so it
+// would cut prompts); `dropped` names what was removed, empty when nothing was.
+std::string strip_tokenizer_length_limits(const std::string& blob, std::string* dropped = nullptr);
 
 }  // namespace sparkinfer_server

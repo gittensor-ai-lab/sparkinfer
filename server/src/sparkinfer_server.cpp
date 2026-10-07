@@ -69,6 +69,13 @@ struct SamplingDefaults {
 };
 SamplingDefaults g_sampling_defaults;
 
+// The whole file, or "" when it cannot be read.
+std::string read_text_file(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) return {};
+    return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+}
+
 void load_sampling_defaults(const std::string& model_path) {
     const char* mode = getenv("SPARKINFER_SAMPLING_DEFAULTS");
     const std::string m = mode ? mode : "generation_config";
@@ -1014,6 +1021,26 @@ int main(int argc, char** argv) {
     }
     g_tokenizer.set_museglimmer(engine.is_museglimmer());
     g_tokenizer.set_qwen38(engine.is_qwen38());
+    if (engine.is_qwen38()) {
+        // The checkpoint's own chat template decides how earlier turns are rendered (see
+        // QwenTemplateVariant). SPARKINFER_QWEN38_TEMPLATE=pinned|official overrides the detection.
+        std::string jinja = read_text_file(model_path + "/chat_template.jinja");
+        if (jinja.empty()) {
+            const std::string cfg = read_text_file(model_path + "/tokenizer_config.json");
+            const auto j = nlohmann::json::parse(cfg, nullptr, false);
+            if (!j.is_discarded() && j.is_object() && j.contains("chat_template") && j["chat_template"].is_string())
+                jinja = j["chat_template"].get<std::string>();
+        }
+        auto variant = sparkinfer_server::qwen38_template_variant(jinja);
+        if (const char* e = getenv("SPARKINFER_QWEN38_TEMPLATE")) {
+            if (std::string(e) == "official") variant = sparkinfer_server::QwenTemplateVariant::kQwen38Official;
+            else if (std::string(e) == "pinned") variant = sparkinfer_server::QwenTemplateVariant::kQwen38Pinned;
+        }
+        g_tokenizer.set_qwen38_template(variant);
+        fprintf(stderr, "[sparkinfer-server] chat template: Qwen3.8 %s%s\n",
+                variant == sparkinfer_server::QwenTemplateVariant::kQwen38Official ? "official" : "pinned",
+                jinja.empty() ? " (no chat_template in the checkpoint; default)" : "");
+    }
     // Turn boundary for the automatic prefix cache: a request checkpoints at its last <|im_start|>.
     {
         const std::vector<int> ims = g_tokenizer.encode_raw("<|im_start|>");

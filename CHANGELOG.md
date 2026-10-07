@@ -5,6 +5,25 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+### Fixed
+
+- **Qwen3.8's reasoning effort follows its chat template.** Both Qwen3.8 templates give xhigh (the
+  default) and low each their own instruction and medium none at all; the server spliced the
+  requested word into the xhigh sentence, so `reasoning_effort: "medium"` was told to think as hard
+  as xhigh and `"low"` the opposite of "keep your thinking brief". OpenAI's `high` / `max` read as
+  xhigh and `minimal` as low.
+- **A Qwen3.8 checkpoint shipping Qwen's own chat template is rendered by its rules**
+  (`QwenTemplateVariant::kQwen38Official`, detected from the checkpoint's `chat_template.jinja`;
+  `SPARKINFER_QWEN38_TEMPLATE=pinned|official` overrides): every kept assistant turn opens with a
+  `<think>` block, empty without `reasoning_content`, and reasoning is never lifted out of content.
+  Fine-tunes such as Swift-Qwen3.8-27B ship that template; gittensor's Qwen3.8-27B-NVFP4-RTX5090
+  keeps its own (pinned) one, unchanged. `chat_template_golden_test` renders 26 requests through
+  both templates with Jinja and holds the server to them byte for byte (52 of 52).
+- **A tokenizer.json's truncation / padding block is ignored.** The Rust tokenizers library applies
+  it to every encode, so a file saved with truncation on cut every prompt without an error --
+  gittensor-model-hub/Swift-Qwen3.8-27B-NVFP4-RTX5090 ships `max_length: 512`, and a 30 KB prompt
+  encoded to 512 tokens. The server now nulls both blocks at load and logs a warning.
+
 ## [0.6.32] — 2026-10-06
 
 **Muse Glimmer at 16 concurrent 8K prompts: 351 tok/s and a 2.5 s first token (was 281 / 9.7 s),

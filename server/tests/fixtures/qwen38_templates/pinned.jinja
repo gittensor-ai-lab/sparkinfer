@@ -1,0 +1,296 @@
+{#
+  Qwen 3.8 compatibility chat template
+  Goals:
+    - Qwen ChatML framing
+    - multimodal image/video placeholders
+    - thinking preservation/toggle support
+    - XML tool calls by default, optional JSON tool calls
+    - grouped tool responses
+    - developer/system compatibility
+    - assistant-prefill safety via continue_final_message
+    - no quantization- or speculative-decoding-specific prompt changes
+#}
+{%- set template_version = "qwen3.8-gittensor-safe-v2" -%}
+{%- set tool_format = tool_call_format if tool_call_format is defined else "xml" -%}
+{%- set add_vision_id = add_vision_id if add_vision_id is defined else false -%}
+{%- set enable_thinking = enable_thinking if enable_thinking is defined else true -%}
+{%- set preserve_thinking = preserve_thinking if preserve_thinking is defined else true -%}
+{%- set auto_disable_thinking_with_tools = auto_disable_thinking_with_tools if auto_disable_thinking_with_tools is defined else false -%}
+{%- set max_tool_arg_chars = max_tool_arg_chars if max_tool_arg_chars is defined else 0 -%}
+{%- set max_tool_response_chars = max_tool_response_chars if max_tool_response_chars is defined else 0 -%}
+{%- set has_tools = tools is defined and tools and tools is iterable and tools is not mapping -%}
+{%- set image_counter = namespace(value=0) -%}
+{%- set video_counter = namespace(value=0) -%}
+{%- set state = namespace(thinking=enable_thinking, previous_role="") -%}
+{%- if auto_disable_thinking_with_tools and has_tools -%}
+  {%- set state.thinking = false -%}
+{%- endif -%}
+
+{%- macro render_content(value, count_vision=false, system_content=false) -%}
+  {%- if value is string -%}
+    {{- value -}}
+  {%- elif value is iterable and value is not mapping -%}
+    {%- for part in value -%}
+      {%- if part is mapping -%}
+        {%- set part_type = part.type if part.type is defined else "" -%}
+        {%- if part_type == "image" or "image" in part or "image_url" in part -%}
+          {%- if system_content -%}
+            {{- raise_exception("System/developer messages cannot contain images.") -}}
+          {%- endif -%}
+          {%- if count_vision -%}
+            {%- set image_counter.value = image_counter.value + 1 -%}
+          {%- endif -%}
+          {%- if add_vision_id -%}
+            {{- "Picture " ~ image_counter.value ~ ": " -}}
+          {%- endif -%}
+          {{- "<|vision_start|><|image_pad|><|vision_end|>" -}}
+        {%- elif part_type == "video" or "video" in part -%}
+          {%- if system_content -%}
+            {{- raise_exception("System/developer messages cannot contain videos.") -}}
+          {%- endif -%}
+          {%- if count_vision -%}
+            {%- set video_counter.value = video_counter.value + 1 -%}
+          {%- endif -%}
+          {%- if add_vision_id -%}
+            {{- "Video " ~ video_counter.value ~ ": " -}}
+          {%- endif -%}
+          {{- "<|vision_start|><|video_pad|><|vision_end|>" -}}
+        {%- elif "text" in part -%}
+          {{- part.text -}}
+        {%- else -%}
+          {{- raise_exception("Unsupported multimodal content item.") -}}
+        {%- endif -%}
+      {%- else -%}
+        {{- part | string -}}
+      {%- endif -%}
+    {%- endfor -%}
+  {%- elif value is none or value is undefined -%}
+    {{- "" -}}
+  {%- else -%}
+    {{- raise_exception("Unsupported message content type.") -}}
+  {%- endif -%}
+{%- endmacro -%}
+
+{%- if not messages -%}
+  {{- raise_exception("No messages provided.") -}}
+{%- endif -%}
+
+{# Pull only the leading system/developer message into the tool system block. #}
+{%- set first_role = messages[0].role -%}
+{%- if first_role == "system" or first_role == "developer" -%}
+  {%- set leading_system = messages[0] -%}
+  {%- set conversation = messages[1:] -%}
+{%- else -%}
+  {%- set leading_system = none -%}
+  {%- set conversation = messages -%}
+{%- endif -%}
+
+{%- set system_text = "" -%}
+{%- if leading_system is not none -%}
+  {%- set system_text = render_content(leading_system.content, false, true) | trim -%}
+  {%- if "<|think_off|>" in system_text -%}
+    {%- set state.thinking = false -%}
+    {%- set system_text = system_text.split("<|think_off|>") | join("") | trim -%}
+  {%- elif "<|think_on|>" in system_text -%}
+    {%- set state.thinking = true -%}
+    {%- set system_text = system_text.split("<|think_on|>") | join("") | trim -%}
+  {%- endif -%}
+{%- endif -%}
+
+{# Reasoning-effort steering. Native Qwen3.8 behaviour: xhigh (default), medium, low.
+   medium intentionally emits no instructions. Honours the resolved thinking state, so
+   enable_thinking=false, <|think_off|> and auto_disable_thinking_with_tools all suppress it. #}
+{%- set reasoning_instructions = "" -%}
+{%- if state.thinking -%}
+  {%- set resolved_reasoning_effort = reasoning_effort if (reasoning_effort is defined and reasoning_effort) else "xhigh" -%}
+  {%- if resolved_reasoning_effort not in ("xhigh", "medium", "low") -%}
+    {{- raise_exception("Unexpected reasoning effort " ~ resolved_reasoning_effort ~ ". Supported types are xhigh (default), medium, and low.") -}}
+  {%- endif -%}
+  {%- if resolved_reasoning_effort == "xhigh" -%}
+    {%- set reasoning_instructions = "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer." -%}
+  {%- elif resolved_reasoning_effort == "low" -%}
+    {%- set reasoning_instructions = "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration." -%}
+  {%- endif -%}
+{%- endif -%}
+
+{%- if has_tools -%}
+  {{- "<|im_start|>system\n" -}}
+  {%- if reasoning_instructions -%}
+    {{- reasoning_instructions ~ "\n\n" -}}
+  {%- endif -%}
+  {{- "# Tools\n\nYou have access to the following functions.\n\n<tools>" -}}
+  {%- for tool in tools -%}
+    {{- "\n" ~ (tool | tojson) -}}
+  {%- endfor -%}
+  {{- "\n</tools>\n\n" -}}
+  {%- if tool_format == "json" -%}
+    {{- "When a tool is needed, emit one or more tool calls in this exact structure:\n<tool_call>\n{\"name\": \"function_name\", \"arguments\": {\"parameter\": \"value\"}}\n</tool_call>\n" -}}
+  {%- else -%}
+    {{- "When a tool is needed, emit one or more tool calls in this exact structure:\n<tool_call>\n<function=function_name>\n<parameter=parameter_name>\nvalue\n</parameter>\n</function>\n</tool_call>\n" -}}
+  {%- endif -%}
+  {{- "If you call a tool, output only an optional <think>...</think> block followed immediately by the <tool_call> block(s); do not add ordinary assistant text before or after the calls. For multiple calls, emit separate fully closed <tool_call> blocks. If no tool is needed, answer normally without a tool call." -}}
+  {%- if system_text -%}
+    {{- "\n\n" ~ system_text -}}
+  {%- endif -%}
+  {{- "<|im_end|>\n" -}}
+{%- elif system_text or reasoning_instructions -%}
+  {{- "<|im_start|>system\n" -}}
+  {%- if reasoning_instructions -%}
+    {{- reasoning_instructions -}}
+    {%- if system_text -%}
+      {{- "\n\n" -}}
+    {%- endif -%}
+  {%- endif -%}
+  {{- system_text ~ "<|im_end|>\n" -}}
+{%- endif -%}
+
+{# Track the newest real user query. Tool responses are role=tool, so no heuristic is needed. #}
+{%- set query_state = namespace(last_user_index=-1) -%}
+{%- for item in conversation -%}
+  {%- if item.role == "user" -%}
+    {%- set candidate_user = render_content(item.content, false) | trim -%}
+    {%- if not (candidate_user.startswith("<tool_response>") and candidate_user.endswith("</tool_response>")) -%}
+      {%- set query_state.last_user_index = loop.index0 -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endfor -%}
+
+{%- for message in conversation -%}
+  {%- set role = message.role -%}
+  {%- set system_like = role == "system" or role == "developer" -%}
+  {%- set content = render_content(message.content, true, system_like) | trim -%}
+
+  {%- set wrapped_tool_response = role == "user" and content.startswith("<tool_response>") and content.endswith("</tool_response>") -%}
+  {%- if system_like or (role == "user" and not wrapped_tool_response) -%}
+    {%- if "<|think_off|>" in content -%}
+      {%- set state.thinking = false -%}
+      {%- set content = content.split("<|think_off|>") | join("") | trim -%}
+    {%- elif "<|think_on|>" in content -%}
+      {%- set state.thinking = true -%}
+      {%- set content = content.split("<|think_on|>") | join("") | trim -%}
+    {%- endif -%}
+  {%- endif -%}
+
+  {%- if system_like -%}
+    {{- "<|im_start|>system\n" ~ content ~ "<|im_end|>\n" -}}
+
+  {%- elif role == "user" -%}
+    {{- "<|im_start|>user\n" ~ content ~ "<|im_end|>\n" -}}
+
+  {%- elif role == "assistant" -%}
+    {%- set reasoning = "" -%}
+    {%- if message.reasoning_content is defined and message.reasoning_content is not none -%}
+      {%- set reasoning = message.reasoning_content if message.reasoning_content is string else (message.reasoning_content | string) -%}
+    {%- elif message.thinking is defined and message.thinking is not none -%}
+      {%- set reasoning = message.thinking if message.thinking is string else (message.thinking | string) -%}
+    {%- else -%}
+      {%- set think_close = "" -%}
+      {%- set think_open = "<think>" -%}
+      {%- if content.startswith("</think>") -%}
+        {%- set think_close = "</think>" -%}
+      {%- elif content.startswith("</thinking>") -%}
+        {%- set think_close = "</thinking>" -%}
+        {%- set think_open = "<thinking>" -%}
+      {%- elif "\n</think>" in content -%}
+        {%- set think_close = "\n</think>" -%}
+      {%- elif "\n</thinking>" in content -%}
+        {%- set think_close = "\n</thinking>" -%}
+        {%- set think_open = "<thinking>" -%}
+      {%- elif "\n</ think>" in content -%}
+        {%- set think_close = "\n</ think>" -%}
+      {%- elif "\n</think >" in content -%}
+        {%- set think_close = "\n</think >" -%}
+      {%- endif -%}
+      {%- if think_close -%}
+        {%- set before_close = content.split(think_close)[0] -%}
+        {%- set reasoning = before_close.split(think_open)[-1] | trim -%}
+        {%- set content = content.split(think_close)[-1] | trim -%}
+      {%- endif -%}
+    {%- endif -%}
+    {%- set reasoning = reasoning | trim -%}
+
+    {{- "<|im_start|>assistant\n" -}}
+    {%- if reasoning and (preserve_thinking or loop.index0 > query_state.last_user_index) -%}
+      {{- "<think>\n" ~ reasoning ~ "\n</think>\n\n" -}}
+    {%- endif -%}
+    {{- content -}}
+
+    {%- if message.tool_calls is defined and message.tool_calls and message.tool_calls is iterable and message.tool_calls is not mapping -%}
+      {%- for raw_call in message.tool_calls -%}
+        {%- set call = raw_call.function if raw_call.function is defined and raw_call.function is not none else raw_call -%}
+        {%- if tool_format == "json" -%}
+          {%- if content | trim or not loop.first -%}{{- "\n\n" -}}{%- endif -%}
+          {%- set serialized_args = "{}" -%}
+          {%- if call.arguments is defined and call.arguments is not none -%}
+            {%- if call.arguments is mapping -%}
+              {%- set serialized_args = call.arguments | tojson -%}
+            {%- elif call.arguments is string and call.arguments -%}
+              {%- set serialized_args = call.arguments -%}
+            {%- endif -%}
+          {%- endif -%}
+          {{- "<tool_call>\n{\"name\": " ~ (call.name | tojson) ~ ", \"arguments\": " ~ serialized_args ~ "}\n</tool_call>" -}}
+        {%- else -%}
+          {%- if content | trim or not loop.first -%}{{- "\n\n" -}}{%- endif -%}
+          {{- "<tool_call>\n<function=" ~ call.name ~ ">\n" -}}
+          {%- if call.arguments is defined and call.arguments is not none -%}
+            {%- if call.arguments is mapping -%}
+              {%- for arg_name in call.arguments -%}
+                {%- set arg_value = call.arguments[arg_name] -%}
+                {%- if arg_value is mapping or (arg_value is sequence and arg_value is not string) -%}
+                  {%- set arg_text = arg_value | tojson -%}
+                {%- else -%}
+                  {%- set arg_text = arg_value | string -%}
+                {%- endif -%}
+                {{- "<parameter=" ~ arg_name ~ ">\n" -}}
+                {%- if max_tool_arg_chars > 0 and arg_text | length > max_tool_arg_chars -%}
+                  {{- arg_text[:max_tool_arg_chars] ~ "\n[TRUNCATED]" -}}
+                {%- else -%}
+                  {{- arg_text -}}
+                {%- endif -%}
+                {{- "\n</parameter>\n" -}}
+              {%- endfor -%}
+            {%- elif call.arguments is string and call.arguments -%}
+              {{- call.arguments -}}
+            {%- endif -%}
+          {%- endif -%}
+          {{- "</function>\n</tool_call>" -}}
+        {%- endif -%}
+      {%- endfor -%}
+    {%- endif -%}
+
+    {# Some runtimes pass this kwarg to Jinja directly. New Transformers also trims via a sentinel. #}
+    {%- if not (loop.last and continue_final_message is defined and continue_final_message) -%}
+      {{- "<|im_end|>\n" -}}
+    {%- endif -%}
+
+  {%- elif role == "tool" -%}
+    {%- if state.previous_role != "tool" -%}
+      {{- "<|im_start|>user" -}}
+    {%- endif -%}
+    {%- if max_tool_response_chars > 0 and content | length > max_tool_response_chars -%}
+      {%- set content = content[:max_tool_response_chars] ~ "\n[TRUNCATED]" -%}
+    {%- endif -%}
+    {{- "\n<tool_response>\n" ~ content ~ "\n</tool_response>" -}}
+    {%- if loop.last or conversation[loop.index0 + 1].role != "tool" -%}
+      {{- "<|im_end|>\n" -}}
+    {%- endif -%}
+
+  {%- else -%}
+    {{- "<|im_start|>user\n[" ~ role ~ "]: " ~ content ~ "<|im_end|>\n" -}}
+  {%- endif -%}
+
+  {%- set state.previous_role = role -%}
+{%- endfor -%}
+
+{# Deterministic precedence: a prefilled final assistant turn wins, so the two flags
+   together can never emit an unterminated turn followed by a fresh assistant header. #}
+{%- set continuing_final = continue_final_message is defined and continue_final_message
+                           and conversation and conversation[-1].role == "assistant" -%}
+{%- if add_generation_prompt and not continuing_final -%}
+  {{- "<|im_start|>assistant\n" -}}
+  {%- if state.thinking -%}
+    {{- "<think>\n" -}}
+  {%- else -%}
+    {{- "<think>\n\n</think>\n\n" -}}
+  {%- endif -%}
+{%- endif -%}

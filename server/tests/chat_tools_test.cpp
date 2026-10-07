@@ -875,8 +875,8 @@ bool test_reasoning_effort_controls() {
     // Calling with two arguments enables thinking but not injection, so this asserted a string the
     // call could not produce. Broken since the assertion was written (3881e0c), which added it
     // against the three-parameter signature 8dbfcdb had already introduced.
-    CHECK(contains(apply_qwen36_tools_template(request, true, true),
-                   "Reasoning effort is set to medium"));
+    // Qwen3.8's templates give medium no instruction at all (only xhigh and low carry one).
+    CHECK(!contains(apply_qwen36_tools_template(request, true, true), "Reasoning effort is set to"));
     // And the default really is off, or the assertion above would pass for the wrong reason.
     CHECK(!contains(apply_qwen36_tools_template(request, true), "Reasoning effort is set to"));
 

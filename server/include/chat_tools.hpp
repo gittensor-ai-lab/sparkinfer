@@ -292,6 +292,23 @@ std::string apply_qwen36_tools_template(const ChatRequest& request,
                                         bool enable_thinking = false,
                                         bool inject_reasoning_effort = false);
 
+// Which chat_template.jinja the prompt reproduces. The bool overload above is kQwen36 (false) or
+// kQwen38Pinned (true).
+//   kQwen36         Qwen3.6 (and the Muse/Bonsai paths that share it): no reasoning-effort message
+//   kQwen38Pinned   gittensor-model-hub/Qwen3.8-27B-NVFP4-RTX5090's template
+//   kQwen38Official Qwen3.8-27B's own template, which fine-tunes such as Swift-Qwen3.8-27B ship
+//                   unmodified: every kept assistant turn carries a <think> block (empty when it
+//                   has no reasoning_content), reasoning is never lifted out of content, and the
+//                   tool instructions are worded differently.
+// tests/chat_template_golden_test.cpp holds both Qwen3.8 variants to their Jinja byte for byte.
+enum class QwenTemplateVariant { kQwen36, kQwen38Pinned, kQwen38Official };
+std::string apply_qwen36_tools_template(const ChatRequest& request, bool enable_thinking,
+                                        QwenTemplateVariant variant);
+// The variant a Qwen3.8 checkpoint's chat_template.jinja text is. The pinned template (and anything
+// unrecognised) is kQwen38Pinned, today's behaviour; only Qwen3.8-27B's own template, recognised by
+// its reasoning-effort instructions without the pinned template's extensions, is kQwen38Official.
+QwenTemplateVariant qwen38_template_variant(const std::string& jinja_text);
+
 ParsedToolOutput parse_qwen36_tool_output(const std::string& raw,
                                           bool enable_thinking,
                                           const ChatRequest& request);

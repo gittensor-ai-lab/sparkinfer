@@ -283,7 +283,39 @@ bool test_gpt2_bytelevel_decode_printable_ascii_roundtrip() {
     return true;
 }
 
+// A tokenizer.json that carries a truncation block (Swift-Qwen3.8-27B-NVFP4-RTX5090 shipped
+// max_length 512) must not cut prompts once the server has loaded it.
+bool test_tokenizer_truncation_is_ignored() {
+    const std::string blob = R"({"version":"1.0",
+        "truncation":{"direction":"Right","max_length":2,"strategy":"LongestFirst","stride":0},
+        "padding":null,"added_tokens":[],"normalizer":null,
+        "pre_tokenizer":{"type":"Whitespace"},"post_processor":null,"decoder":null,
+        "model":{"type":"WordLevel","vocab":{"a":0,"b":1,"c":2,"[UNK]":3},"unk_token":"[UNK]"}})";
+    std::string dropped;
+    const std::string clean = sparkinfer_server::strip_tokenizer_length_limits(blob, &dropped);
+    CHECK(dropped.find("truncation") != std::string::npos);
+    CHECK(clean.find("max_length") == std::string::npos);
+    const std::string path = "/tmp/sparkinfer_trunc_tokenizer_test.json";
+    {
+        FILE* f = std::fopen(path.c_str(), "wb");
+        CHECK(f != nullptr);
+        std::fwrite(blob.data(), 1, blob.size(), f);
+        std::fclose(f);
+    }
+    sparkinfer_server::ChatTokenizer tok;
+    std::string err;
+    CHECK(tok.load(path, err));
+    CHECK(tok.encode_raw("a b c a b c").size() == 6);
+    std::remove(path.c_str());
+    // An ordinary file (both blocks null, pretty-printed) passes through byte for byte.
+    const std::string plain = "{\n  \"truncation\": null,\n  \"padding\": null\n}";
+    CHECK(sparkinfer_server::strip_tokenizer_length_limits(plain, &dropped) == plain);
+    CHECK(dropped.empty());
+    return true;
+}
+
 int main() {
+    if (!test_tokenizer_truncation_is_ignored()) return 1;
     if (!test_thinking_prompt_and_nonstream_parser()) return 1;
     if (!test_thinking_stream_boundaries()) return 1;
     if (!test_thinking_stream_repeated_opening_marker()) return 1;

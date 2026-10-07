@@ -228,6 +228,7 @@ struct ChatTokenizer::Impl {
     std::unique_ptr<tokenizers::Tokenizer> tok;
     bool museglimmer = false;
     bool qwen38 = false;
+    QwenTemplateVariant qwen38_template = QwenTemplateVariant::kQwen38Pinned;
     // Muse Glimmer harmony-format marker token ids, resolved once in set_museglimmer() (single
     // -threaded server startup, after `tok` is loaded) -- see decode()'s comment for why these
     // need special handling. Deliberately NOT lazily resolved on first decode(): decode() runs
@@ -240,13 +241,51 @@ struct ChatTokenizer::Impl {
 ChatTokenizer::ChatTokenizer() : impl_(std::make_unique<Impl>()) {}
 ChatTokenizer::~ChatTokenizer() = default;
 
+// A tokenizer.json can carry a truncation (or padding) block from whatever last saved it -- a
+// quantization pipeline that tokenized with truncation on writes it back out. The Rust tokenizers
+// library applies it to every encode(), so a server loading such a file cuts each prompt to that
+// length without an error: gittensor-model-hub/Swift-Qwen3.8-27B-NVFP4-RTX5090 shipped
+// max_length 512, and a 30 KB prompt encoded to 512 tokens. A server must see the whole prompt,
+// so both blocks are dropped (and said so) before the library sees the file.
+std::string strip_tokenizer_length_limits(const std::string& blob, std::string* dropped) {
+    if (dropped) dropped->clear();
+    // Cheap pre-check: the common file has both as literal nulls and needs no re-serialization.
+    auto is_null = [&](const char* key) {
+        const std::string k = std::string("\"") + key + "\":";
+        for (size_t at = blob.find(k); at != std::string::npos; at = blob.find(k, at + 1)) {
+            size_t v = at + k.size();
+            while (v < blob.size() && (blob[v] == ' ' || blob[v] == '\n' || blob[v] == '\t')) ++v;
+            if (blob.compare(v, 4, "null") == 0) return true;
+        }
+        return false;
+    };
+    if (is_null("truncation") && is_null("padding")) return blob;
+    nlohmann::ordered_json root = nlohmann::ordered_json::parse(blob, nullptr, false);
+    if (root.is_discarded() || !root.is_object()) return blob;
+    std::string what;
+    for (const char* key : {"truncation", "padding"}) {
+        auto it = root.find(key);
+        if (it == root.end() || it->is_null()) continue;
+        what += (what.empty() ? "" : ", ") + std::string(key) + " " + it->dump();
+        *it = nullptr;
+    }
+    if (what.empty()) return blob;
+    if (dropped) *dropped = what;
+    return root.dump();
+}
+
 bool ChatTokenizer::load(const std::string& tokenizer_json_path, std::string& err) {
     std::lock_guard<std::recursive_mutex> tok_lock(tok_mu_);
-    const std::string blob = read_file(tokenizer_json_path);
+    std::string blob = read_file(tokenizer_json_path);
     if (blob.empty()) {
         err = "cannot read tokenizer: " + tokenizer_json_path;
         return false;
     }
+    std::string dropped;
+    blob = strip_tokenizer_length_limits(blob, &dropped);
+    if (!dropped.empty())
+        fprintf(stderr, "[sparkinfer-server] WARNING: %s sets %s; ignored -- prompts are never "
+                        "truncated or padded\n", tokenizer_json_path.c_str(), dropped.c_str());
     try {
         impl_->tok = tokenizers::Tokenizer::FromBlobJSON(blob);
     } catch (const std::exception& e) {
@@ -263,6 +302,8 @@ bool ChatTokenizer::load(const std::string& tokenizer_json_path, std::string& er
 }
 
 void ChatTokenizer::set_qwen38(bool on) { impl_->qwen38 = on; }
+
+void ChatTokenizer::set_qwen38_template(QwenTemplateVariant variant) { impl_->qwen38_template = variant; }
 
 void ChatTokenizer::set_museglimmer(bool on) {
     impl_->museglimmer = on;
@@ -705,7 +746,8 @@ std::vector<int> ChatTokenizer::encode_augmented(const ChatRequest& request, boo
     if (!impl_->tok) return {};
     const std::string prompt = impl_->museglimmer
         ? apply_museglimmer_chat_template(request.messages, enable_thinking ? "high" : "low")
-        : apply_qwen36_tools_template(request, enable_thinking, impl_->qwen38);
+        : apply_qwen36_tools_template(request, enable_thinking,
+                                      impl_->qwen38 ? impl_->qwen38_template : QwenTemplateVariant::kQwen36);
     const std::vector<int32_t> enc = impl_->tok->Encode(prompt);
     return std::vector<int>(enc.begin(), enc.end());
 }

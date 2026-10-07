@@ -104,6 +104,19 @@ if(BUILD_TESTS)
     target_compile_features(chat_tools_test PRIVATE cxx_std_17)
     add_test(NAME chat_tools_test COMMAND chat_tools_test)
 
+    # Qwen3.8 prompts against the checkpoints' own chat_template.jinja, byte for byte. CPU-only.
+    add_executable(chat_template_golden_test
+        tests/chat_template_golden_test.cpp
+        src/chat_tools.cpp
+    )
+    target_include_directories(chat_template_golden_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(chat_template_golden_test PRIVATE nlohmann_json::nlohmann_json re2::re2)
+    target_compile_definitions(chat_template_golden_test PRIVATE
+        SPARKINFER_SERVER_TEST_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests"
+    )
+    target_compile_features(chat_template_golden_test PRIVATE cxx_std_17)
+    add_test(NAME chat_template_golden_test COMMAND chat_template_golden_test)
+
     # Constrained tool calls: every output the grammar admits must parse. CPU-only, no model.
     add_executable(tool_grammar_test
         tests/tool_grammar_test.cpp

@@ -1881,18 +1881,47 @@ bool should_reject_dflash_logit_bias(bool dflash_env_on, bool has_logit_bias) {
     return dflash_env_on && has_logit_bias;
 }
 
+QwenTemplateVariant qwen38_template_variant(const std::string& jinja_text) {
+    const bool pinned_extensions = jinja_text.find("auto_disable_thinking_with_tools") != std::string::npos ||
+                                   jinja_text.find("tool_call_format") != std::string::npos;
+    const bool official_rules = jinja_text.find("Reasoning effort is set to") != std::string::npos &&
+                                jinja_text.find("preserve_thinking is undefined or preserve_thinking is true") !=
+                                    std::string::npos;
+    return (official_rules && !pinned_extensions) ? QwenTemplateVariant::kQwen38Official
+                                                  : QwenTemplateVariant::kQwen38Pinned;
+}
+
 std::string apply_qwen36_tools_template(const ChatRequest& request, bool enable_thinking,
                                         bool inject_reasoning_effort) {
+    return apply_qwen36_tools_template(request, enable_thinking,
+                                       inject_reasoning_effort ? QwenTemplateVariant::kQwen38Pinned
+                                                               : QwenTemplateVariant::kQwen36);
+}
+
+std::string apply_qwen36_tools_template(const ChatRequest& request, bool enable_thinking,
+                                        QwenTemplateVariant variant) {
+    const bool inject_reasoning_effort = variant != QwenTemplateVariant::kQwen36;
     std::ostringstream out;
     size_t first_message = 0;
     const bool tools_active = !request.tools.empty() && request.tool_choice != ToolChoiceMode::kNone;
     const bool json_mode = request.response_format.type != ResponseFormatType::kText;
-    const std::string effort = request.reasoning_effort.empty() ? "xhigh" : request.reasoning_effort;
-    const std::string reasoning_instructions = (inject_reasoning_effort && enable_thinking)
-        ? "Reasoning effort is set to " + effort + ". Please think carefully through the task, validate "
-          "key assumptions, consider plausible alternatives, and prioritize correctness, "
-          "consistency, and clarity in the final answer."
-        : std::string();
+    // Both Qwen3.8 templates know three efforts, each with its own instruction or none: xhigh (the
+    // default) and low carry a sentence, medium carries nothing. Splicing the requested word into
+    // the xhigh sentence -- what this did -- told a medium request to think as hard as xhigh and a
+    // low one the opposite of the template's "keep your thinking brief". The templates raise on any
+    // other value; OpenAI's high / max read as xhigh and minimal as low rather than failing.
+    const std::string& effort = request.reasoning_effort;
+    std::string reasoning_instructions;
+    if (inject_reasoning_effort && enable_thinking) {
+        if (effort == "low" || effort == "minimal")
+            reasoning_instructions = "Reasoning effort is set to low. Keep your thinking brief and focused, "
+                                     "moving directly to the conclusion without unnecessary elaboration.";
+        else if (effort != "medium")
+            reasoning_instructions = "Reasoning effort is set to xhigh. Please think carefully through the "
+                                     "task, validate key assumptions, consider plausible alternatives, and "
+                                     "prioritize correctness, consistency, and clarity in the final answer.";
+    }
+    const bool official = variant == QwenTemplateVariant::kQwen38Official;
     const bool has_leading_system = !request.messages.empty() && request.messages[0].role == "system";
     // Request-time validation (parse_chat_request_json) rejects tools + response_format
     // together, so tools_active and json_mode are never both true -- written as two independent
@@ -1967,7 +1996,20 @@ std::string apply_qwen36_tools_template(const ChatRequest& request, bool enable_
             continue;
         }
         out << kImStart << message.role << '\n';
-        if (message.role == "assistant") {
+        if (message.role == "assistant" && official) {
+            // Qwen3.8-27B's own rule: a kept turn ALWAYS opens with a <think> block, empty when
+            // the message has no reasoning_content, and reasoning is read from that field only --
+            // a <think> written inside content stays in content.
+            const std::string content = trim_copy(message.content);
+            if (request.preserve_thinking || i > last_user)
+                out << kThinkOpen << '\n' << trim_copy(message.reasoning_content) << '\n' << kThinkClose << "\n\n";
+            out << content;
+            for (size_t j = 0; j < message.tool_calls.size(); ++j) {
+                if (j == 0 && !content.empty()) out << "\n\n";
+                else if (j > 0) out << '\n';
+                out << render_tool_call(message.tool_calls[j]);
+            }
+        } else if (message.role == "assistant") {
             std::string content = trim_copy(message.content);
             std::string reasoning = trim_copy(message.reasoning_content);
             // Match the pinned tokenizer template's compatibility path for clients which put

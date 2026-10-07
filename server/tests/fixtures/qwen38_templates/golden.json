@@ -1,0 +1,644 @@
+[
+ {
+  "name": "single/think",
+  "body": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi there"
+    }
+   ],
+   "enable_thinking": true
+  },
+  "enable_thinking": true,
+  "expected": {
+   "pinned": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nHi there<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "official": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nHi there<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  }
+ },
+ {
+  "name": "single/nothink",
+  "body": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi there"
+    }
+   ],
+   "enable_thinking": false
+  },
+  "enable_thinking": false,
+  "expected": {
+   "pinned": "<|im_start|>user\nHi there<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "official": "<|im_start|>user\nHi there<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  }
+ },
+ {
+  "name": "system/think",
+  "body": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are helpful."
+    },
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ],
+   "enable_thinking": true
+  },
+  "enable_thinking": true,
+  "expected": {
+   "pinned": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\nYou are helpful.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "official": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\nYou are helpful.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  }
+ },
+ {
+  "name": "system/nothink",
+  "body": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are helpful."
+    },
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ],
+   "enable_thinking": false
+  },
+  "enable_thinking": false,
+  "expected": {
+   "pinned": "<|im_start|>system\nYou are helpful.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "official": "<|im_start|>system\nYou are helpful.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  }
+ },
+ {
+  "name": "multi_turn/think",
+  "body": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Q1"
+    },
+    {
+     "role": "assistant",
+     "content": "A1"
+    },
+    {
+     "role": "user",
+     "content": "Q2"
+    }
+   ],
+   "enable_thinking": true
+  },
+  "enable_thinking": true,
+  "expected": {
+   "pinned": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nQ1<|im_end|>\n<|im_start|>assistant\nA1<|im_end|>\n<|im_start|>user\nQ2<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "official": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nQ1<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nA1<|im_end|>\n<|im_start|>user\nQ2<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  }
+ },
+ {
+  "name": "multi_turn/nothink",
+  "body": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Q1"
+    },
+    {
+     "role": "assistant",
+     "content": "A1"
+    },
+    {
+     "role": "user",
+     "content": "Q2"
+    }
+   ],
+   "enable_thinking": false
+  },
+  "enable_thinking": false,
+  "expected": {
+   "pinned": "<|im_start|>user\nQ1<|im_end|>\n<|im_start|>assistant\nA1<|im_end|>\n<|im_start|>user\nQ2<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "official": "<|im_start|>user\nQ1<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nA1<|im_end|>\n<|im_start|>user\nQ2<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  }
+ },
+ {
+  "name": "multi_turn_system/think",
+  "body": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "Be brief."
+    },
+    {
+     "role": "user",
+     "content": "Q1"
+    },
+    {
+     "role": "assistant",
+     "content": "A1"
+    },
+    {
+     "role": "user",
+     "content": "Q2"
+    }
+   ],
+   "enable_thinking": true
+  },
+  "enable_thinking": true,
+  "expected": {
+   "pinned": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\nBe brief.<|im_end|>\n<|im_start|>user\nQ1<|im_end|>\n<|im_start|>assistant\nA1<|im_end|>\n<|im_start|>user\nQ2<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "official": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\nBe brief.<|im_end|>\n<|im_start|>user\nQ1<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nA1<|im_end|>\n<|im_start|>user\nQ2<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  }
+ },
+ {
+  "name": "multi_turn_system/nothink",
+  "body": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "Be brief."
+    },
+    {
+     "role": "user",
+     "content": "Q1"
+    },
+    {
+     "role": "assistant",
+     "content": "A1"
+    },
+    {
+     "role": "user",
+     "content": "Q2"
+    }
+   ],
+   "enable_thinking": false
+  },
+  "enable_thinking": false,
+  "expected": {
+   "pinned": "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nQ1<|im_end|>\n<|im_start|>assistant\nA1<|im_end|>\n<|im_start|>user\nQ2<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "official": "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nQ1<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nA1<|im_end|>\n<|im_start|>user\nQ2<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  }
+ },
+ {
+  "name": "reasoning_content/think",
+  "body": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Q1"
+    },
+    {
+     "role": "assistant",
+     "content": "A1",
+     "reasoning_content": "step one\nstep two"
+    },
+    {
+     "role": "user",
+     "content": "Q2"
+    }
+   ],
+   "enable_thinking": true
+  },
+  "enable_thinking": true,
+  "expected": {
+   "pinned": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nQ1<|im_end|>\n<|im_start|>assistant\n<think>\nstep one\nstep two\n</think>\n\nA1<|im_end|>\n<|im_start|>user\nQ2<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "official": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nQ1<|im_end|>\n<|im_start|>assistant\n<think>\nstep one\nstep two\n</think>\n\nA1<|im_end|>\n<|im_start|>user\nQ2<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  }
+ },
+ {
+  "name": "reasoning_content/nothink",
+  "body": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Q1"
+    },
+    {
+     "role": "assistant",
+     "content": "A1",
+     "reasoning_content": "step one\nstep two"
+    },
+    {
+     "role": "user",
+     "content": "Q2"
+    }
+   ],
+   "enable_thinking": false
+  },
+  "enable_thinking": false,
+  "expected": {
+   "pinned": "<|im_start|>user\nQ1<|im_end|>\n<|im_start|>assistant\n<think>\nstep one\nstep two\n</think>\n\nA1<|im_end|>\n<|im_start|>user\nQ2<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "official": "<|im_start|>user\nQ1<|im_end|>\n<|im_start|>assistant\n<think>\nstep one\nstep two\n</think>\n\nA1<|im_end|>\n<|im_start|>user\nQ2<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  }
+ },
+ {
+  "name": "embedded_think/think",
+  "body": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Q1"
+    },
+    {
+     "role": "assistant",
+     "content": "<think>\nreasoning here\n</think>\n\nA1"
+    },
+    {
+     "role": "user",
+     "content": "Q2"
+    }
+   ],
+   "enable_thinking": true
+  },
+  "enable_thinking": true,
+  "expected": {
+   "pinned": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nQ1<|im_end|>\n<|im_start|>assistant\n<think>\nreasoning here\n</think>\n\nA1<|im_end|>\n<|im_start|>user\nQ2<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "official": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nQ1<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<think>\nreasoning here\n</think>\n\nA1<|im_end|>\n<|im_start|>user\nQ2<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  }
+ },
+ {
+  "name": "embedded_think/nothink",
+  "body": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Q1"
+    },
+    {
+     "role": "assistant",
+     "content": "<think>\nreasoning here\n</think>\n\nA1"
+    },
+    {
+     "role": "user",
+     "content": "Q2"
+    }
+   ],
+   "enable_thinking": false
+  },
+  "enable_thinking": false,
+  "expected": {
+   "pinned": "<|im_start|>user\nQ1<|im_end|>\n<|im_start|>assistant\n<think>\nreasoning here\n</think>\n\nA1<|im_end|>\n<|im_start|>user\nQ2<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "official": "<|im_start|>user\nQ1<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<think>\nreasoning here\n</think>\n\nA1<|im_end|>\n<|im_start|>user\nQ2<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  }
+ },
+ {
+  "name": "no_preserve/think",
+  "body": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Q1"
+    },
+    {
+     "role": "assistant",
+     "content": "A1",
+     "reasoning_content": "old reasoning"
+    },
+    {
+     "role": "user",
+     "content": "Q2"
+    }
+   ],
+   "enable_thinking": true,
+   "chat_template_kwargs": {
+    "preserve_thinking": false
+   }
+  },
+  "enable_thinking": true,
+  "expected": {
+   "pinned": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nQ1<|im_end|>\n<|im_start|>assistant\nA1<|im_end|>\n<|im_start|>user\nQ2<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "official": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nQ1<|im_end|>\n<|im_start|>assistant\nA1<|im_end|>\n<|im_start|>user\nQ2<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  }
+ },
+ {
+  "name": "no_preserve/nothink",
+  "body": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Q1"
+    },
+    {
+     "role": "assistant",
+     "content": "A1",
+     "reasoning_content": "old reasoning"
+    },
+    {
+     "role": "user",
+     "content": "Q2"
+    }
+   ],
+   "enable_thinking": false,
+   "chat_template_kwargs": {
+    "preserve_thinking": false
+   }
+  },
+  "enable_thinking": false,
+  "expected": {
+   "pinned": "<|im_start|>user\nQ1<|im_end|>\n<|im_start|>assistant\nA1<|im_end|>\n<|im_start|>user\nQ2<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "official": "<|im_start|>user\nQ1<|im_end|>\n<|im_start|>assistant\nA1<|im_end|>\n<|im_start|>user\nQ2<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  }
+ },
+ {
+  "name": "two_turns_reasoning/think",
+  "body": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Q1"
+    },
+    {
+     "role": "assistant",
+     "content": "A1",
+     "reasoning_content": "r1"
+    },
+    {
+     "role": "user",
+     "content": "Q2"
+    },
+    {
+     "role": "assistant",
+     "content": "A2",
+     "reasoning_content": "r2"
+    },
+    {
+     "role": "user",
+     "content": "Q3"
+    }
+   ],
+   "enable_thinking": true
+  },
+  "enable_thinking": true,
+  "expected": {
+   "pinned": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nQ1<|im_end|>\n<|im_start|>assistant\n<think>\nr1\n</think>\n\nA1<|im_end|>\n<|im_start|>user\nQ2<|im_end|>\n<|im_start|>assistant\n<think>\nr2\n</think>\n\nA2<|im_end|>\n<|im_start|>user\nQ3<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "official": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nQ1<|im_end|>\n<|im_start|>assistant\n<think>\nr1\n</think>\n\nA1<|im_end|>\n<|im_start|>user\nQ2<|im_end|>\n<|im_start|>assistant\n<think>\nr2\n</think>\n\nA2<|im_end|>\n<|im_start|>user\nQ3<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  }
+ },
+ {
+  "name": "two_turns_reasoning/nothink",
+  "body": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Q1"
+    },
+    {
+     "role": "assistant",
+     "content": "A1",
+     "reasoning_content": "r1"
+    },
+    {
+     "role": "user",
+     "content": "Q2"
+    },
+    {
+     "role": "assistant",
+     "content": "A2",
+     "reasoning_content": "r2"
+    },
+    {
+     "role": "user",
+     "content": "Q3"
+    }
+   ],
+   "enable_thinking": false
+  },
+  "enable_thinking": false,
+  "expected": {
+   "pinned": "<|im_start|>user\nQ1<|im_end|>\n<|im_start|>assistant\n<think>\nr1\n</think>\n\nA1<|im_end|>\n<|im_start|>user\nQ2<|im_end|>\n<|im_start|>assistant\n<think>\nr2\n</think>\n\nA2<|im_end|>\n<|im_start|>user\nQ3<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "official": "<|im_start|>user\nQ1<|im_end|>\n<|im_start|>assistant\n<think>\nr1\n</think>\n\nA1<|im_end|>\n<|im_start|>user\nQ2<|im_end|>\n<|im_start|>assistant\n<think>\nr2\n</think>\n\nA2<|im_end|>\n<|im_start|>user\nQ3<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  }
+ },
+ {
+  "name": "effort_xhigh/think",
+  "body": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ],
+   "enable_thinking": true,
+   "reasoning_effort": "xhigh"
+  },
+  "enable_thinking": true,
+  "expected": {
+   "pinned": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "official": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  }
+ },
+ {
+  "name": "effort_xhigh/nothink",
+  "body": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ],
+   "enable_thinking": false,
+   "reasoning_effort": "xhigh"
+  },
+  "enable_thinking": false,
+  "expected": {
+   "pinned": "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "official": "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  }
+ },
+ {
+  "name": "effort_medium/think",
+  "body": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ],
+   "enable_thinking": true,
+   "reasoning_effort": "medium"
+  },
+  "enable_thinking": true,
+  "expected": {
+   "pinned": "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "official": "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  }
+ },
+ {
+  "name": "effort_medium/nothink",
+  "body": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ],
+   "enable_thinking": false,
+   "reasoning_effort": "medium"
+  },
+  "enable_thinking": false,
+  "expected": {
+   "pinned": "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "official": "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  }
+ },
+ {
+  "name": "effort_low/think",
+  "body": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ],
+   "enable_thinking": true,
+   "reasoning_effort": "low"
+  },
+  "enable_thinking": true,
+  "expected": {
+   "pinned": "<|im_start|>system\nReasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "official": "<|im_start|>system\nReasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  }
+ },
+ {
+  "name": "effort_low/nothink",
+  "body": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ],
+   "enable_thinking": false,
+   "reasoning_effort": "low"
+  },
+  "enable_thinking": false,
+  "expected": {
+   "pinned": "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "official": "<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  }
+ },
+ {
+  "name": "effort_low_system/think",
+  "body": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "Q1"
+    },
+    {
+     "role": "assistant",
+     "content": "A1",
+     "reasoning_content": "r"
+    },
+    {
+     "role": "user",
+     "content": "Q2"
+    }
+   ],
+   "enable_thinking": true,
+   "reasoning_effort": "low"
+  },
+  "enable_thinking": true,
+  "expected": {
+   "pinned": "<|im_start|>system\nReasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.\n\nYou are terse.<|im_end|>\n<|im_start|>user\nQ1<|im_end|>\n<|im_start|>assistant\n<think>\nr\n</think>\n\nA1<|im_end|>\n<|im_start|>user\nQ2<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "official": "<|im_start|>system\nReasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.\n\nYou are terse.<|im_end|>\n<|im_start|>user\nQ1<|im_end|>\n<|im_start|>assistant\n<think>\nr\n</think>\n\nA1<|im_end|>\n<|im_start|>user\nQ2<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  }
+ },
+ {
+  "name": "effort_low_system/nothink",
+  "body": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are terse."
+    },
+    {
+     "role": "user",
+     "content": "Q1"
+    },
+    {
+     "role": "assistant",
+     "content": "A1",
+     "reasoning_content": "r"
+    },
+    {
+     "role": "user",
+     "content": "Q2"
+    }
+   ],
+   "enable_thinking": false,
+   "reasoning_effort": "low"
+  },
+  "enable_thinking": false,
+  "expected": {
+   "pinned": "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nQ1<|im_end|>\n<|im_start|>assistant\n<think>\nr\n</think>\n\nA1<|im_end|>\n<|im_start|>user\nQ2<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "official": "<|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nQ1<|im_end|>\n<|im_start|>assistant\n<think>\nr\n</think>\n\nA1<|im_end|>\n<|im_start|>user\nQ2<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  }
+ },
+ {
+  "name": "whitespace/think",
+  "body": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "  padded system  \n"
+    },
+    {
+     "role": "user",
+     "content": "  Q with spaces \n"
+    },
+    {
+     "role": "assistant",
+     "content": "  A1 \n"
+    },
+    {
+     "role": "user",
+     "content": "Q2"
+    }
+   ],
+   "enable_thinking": true
+  },
+  "enable_thinking": true,
+  "expected": {
+   "pinned": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\npadded system<|im_end|>\n<|im_start|>user\nQ with spaces<|im_end|>\n<|im_start|>assistant\nA1<|im_end|>\n<|im_start|>user\nQ2<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "official": "<|im_start|>system\nReasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.\n\npadded system<|im_end|>\n<|im_start|>user\nQ with spaces<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nA1<|im_end|>\n<|im_start|>user\nQ2<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  }
+ },
+ {
+  "name": "whitespace/nothink",
+  "body": {
+   "messages": [
+    {
+     "role": "system",
+     "content": "  padded system  \n"
+    },
+    {
+     "role": "user",
+     "content": "  Q with spaces \n"
+    },
+    {
+     "role": "assistant",
+     "content": "  A1 \n"
+    },
+    {
+     "role": "user",
+     "content": "Q2"
+    }
+   ],
+   "enable_thinking": false
+  },
+  "enable_thinking": false,
+  "expected": {
+   "pinned": "<|im_start|>system\npadded system<|im_end|>\n<|im_start|>user\nQ with spaces<|im_end|>\n<|im_start|>assistant\nA1<|im_end|>\n<|im_start|>user\nQ2<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "official": "<|im_start|>system\npadded system<|im_end|>\n<|im_start|>user\nQ with spaces<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nA1<|im_end|>\n<|im_start|>user\nQ2<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+  }
+ }
+]
