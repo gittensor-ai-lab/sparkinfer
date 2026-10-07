@@ -3946,6 +3946,21 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     kernels::launch_norm_then_add(x + (size_t)fo * H, ao + (size_t)fo * H,
                                                   w.post_attn_norm, h + (size_t)fo * H, fn, H,
                                                   1e-8f, st);
+                // The up GEMM can run SwiGLU and the down projection's FP4 quantize in its own
+                // epilogue, reading the gate output as its source: the bf16 up tensor is never
+                // written and swiglu_quant_rows never reads gate/up back. Only where the FP4 down
+                // GEMM below will consume the result, and only at prefill widths -- at 1024 rows
+                // the heavier epilogue already costs what the second pass did.
+                // SPARKINFER_NVFP4_SWIGLU_EPI=0 restores the separate pass (A/B).
+                static const int swi_min_rows = [] {
+                    const char* e = getenv("SPARKINFER_NVFP4_SWIGLU_EPI_MIN_ROWS");
+                    return e ? atoi(e) : 2048;
+                }();
+                const bool swi_epi = nvfp4_down && dn_fp4 && dn_fp4_sf && fp4_down_a &&
+                    fp4_down_as && fn >= swi_min_rows &&
+                    kernels::prefill_nvfp4_swiglu_epilogue_on() &&
+                    kernels::prefill_nvfp4_supported(fn, H, ffn);
+                bool swi_done = false;
                 const bool layer_fp4 = gu_nvfp4 && f4_g && f4_gs &&
                     f4_u && f4_us && fp4_a && fp4_as &&
                     kernels::prefill_nvfp4_supported(fn, ffn, H) &&
@@ -3966,15 +3981,19 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                      : kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_as, f4_g, f4_gs,
                                                          ffg, fn, ffn, H, fp4_ws, st,
                                                          f4_ga)) &&
-                    kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_as, f4_u, f4_us,
-                                                       ffu, fn, ffn, H, fp4_ws, st,
-                                                       f4_ua);
+                    ((swi_epi && (swi_done = kernels::launch_prefill_nvfp4_gemm_swiglu_quant(
+                                      fp4_a, fp4_as, f4_u, f4_us, ffg, fp4_down_a,
+                                      fp4_down_as, fn, ffn, H, st, f4_ua))) ||
+                     kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_as, f4_u, f4_us,
+                                                        ffu, fn, ffn, H, fp4_ws, st,
+                                                        f4_ua));
                 if (layer_fp4) {
                     bf16* xc = x + (size_t)fo * H;
-                    const bool down_swiglu_q = nvfp4_down && dn_fp4 && dn_fp4_sf &&
-                        fp4_down_a && fp4_down_as &&
-                        kernels::launch_prefill_nvfp4_swiglu_quant_a(
-                            ffg, ffu, fp4_down_a, fp4_down_as, fn, ffn, st);
+                    const bool down_swiglu_q = swi_done ||
+                        (nvfp4_down && dn_fp4 && dn_fp4_sf &&
+                         fp4_down_a && fp4_down_as &&
+                         kernels::launch_prefill_nvfp4_swiglu_quant_a(
+                             ffg, ffu, fp4_down_a, fp4_down_as, fn, ffn, st));
                     const bool down_fp4_resid = down_swiglu_q && ffn_fp4_resid &&
                         kernels::launch_prefill_nvfp4_gemm(
                             fp4_down_a, fp4_down_as, f4_d, f4_ds,
@@ -3986,6 +4005,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                             ao + (size_t)fo * H, fn, H, ffn, fp4_ws, st,
                             f4_da));
                     if (!down_fp4_done) {
+                        // The fused up GEMM never wrote ffu; the paths below read it.
+                        if (swi_done)
+                            kernels::launch_prefill_nvfp4_gemm(fp4_a, fp4_as, f4_u, f4_us, ffu,
+                                                               fn, ffn, H, fp4_ws, st, f4_ua);
                         // The fused down GEMM reads SwiGLU's output only as its int8 operand, so
                         // form it in one pass over gate/up (launch_prefill_swiglu_quant_i8) instead
                         // of storing the bf16 SwiGLU and quantizing it back: same bf16-rounded h,

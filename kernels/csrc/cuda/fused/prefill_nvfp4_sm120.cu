@@ -30,7 +30,180 @@
 #include <cutlass/util/packed_stride.hpp>
 #include <cute/tensor.hpp>
 
+#include <cutlass/epilogue/thread/activation.h>
+#include <cutlass/epilogue/fusion/sm120_callbacks_tma_warpspecialized.hpp>
+
 #include <cstdlib>
+
+// D = quant(bf16(silu(C) * bf16(alpha * acc))), the up projection of a SwiGLU FFN reading the gate
+// projection's bf16 output as its source and writing the down projection's NVFP4 A operand with
+// its UE4M3 block scales. The two bf16 roundings are the ones the unfused path takes -- the up GEMM
+// stores bf16, swiglu_quant_rows rounds SiLU(g) * u once to bf16 -- so the values reaching the
+// quantizer are the same. The scale-factor store is CUTLASS's own (the one LinCombBlockScaleFactor
+// uses), so the scales land in the Sm1xxBlockScaledOutputConfig layout, which is the SFA layout
+// the down projection reads.
+namespace sparkinfer::kernels {
+template <class T> struct SwigluBf16;
+template <int N>
+struct SwigluBf16<cutlass::Array<float, N>> {
+    CUTLASS_DEVICE cutlass::Array<float, N>
+    operator()(cutlass::Array<float, N> const& g, cutlass::Array<float, N> const& u) const {
+        static_assert(N % 2 == 0, "pairs of accumulator values");
+        cutlass::Array<float, N> r;
+        CUTLASS_PRAGMA_UNROLL
+        for (int i = 0; i < N; i += 2) {
+            // Paired conversions: one F2F per two values each way, same round-to-nearest-even.
+            const float2 ub = __bfloat1622float2(__floats2bfloat162_rn(u[i], u[i + 1]));
+            const float2 h = __bfloat1622float2(__floats2bfloat162_rn(
+                g[i] / (1.f + __expf(-g[i])) * ub.x, g[i + 1] / (1.f + __expf(-g[i + 1])) * ub.y));
+            r[i] = h.x;
+            r[i + 1] = h.y;
+        }
+        return r;
+    }
+};
+} // namespace sparkinfer::kernels
+
+namespace cutlass::epilogue::fusion {
+// CUTLASS's row scale-factor store with this file's own quantizer recipe: the scale is
+// ue4m3(max(amax / 6, 2^-9)) and each value is x / scale, exactly as quant_rows and
+// swiglu_quant_rows compute it. The stock store has no floor, so a 16-value group whose amax is
+// below 6 * 2^-10 gets a zero scale and is flushed to zero -- over half the groups of the first
+// FFN layer on Qwen3.8. Only the reduction changes: at 16-value vectors a scale is reduced inside
+// one quad, so there is no cross-warp exchange to carry over.
+template <class EpilogueTile, class CtaTileShapeMNK, int FragmentSize>
+struct FlooredSf16RowStore
+    : Sm120BlockScaleFactorRowStore<16, EpilogueTile, CtaTileShapeMNK, FragmentSize,
+                                    cutlass::float_e2m1_t, float, cutlass::float_ue4m3_t> {
+    using Base = Sm120BlockScaleFactorRowStore<16, EpilogueTile, CtaTileShapeMNK, FragmentSize,
+                                               cutlass::float_e2m1_t, float,
+                                               cutlass::float_ue4m3_t>;
+    using Base::Base;
+
+    template <class RTensor, class GTensor, class CoordGTensor, class ThrResidue,
+              class TileCoordMN>
+    struct ConsumerStoreCallbacks : EmptyConsumerStoreCallbacks {
+        CUTLASS_DEVICE
+        ConsumerStoreCallbacks(RTensor&& r, GTensor&& g, CoordGTensor c, ThrResidue res,
+                               TileCoordMN t, int thread)
+            : tC_rSFD(cute::forward<RTensor>(r)), tC_gSFD(cute::forward<GTensor>(g)),
+              tC_cSFD(c), residue_tC_cSFD(res), tile_coord_mn(t), thread_idx(thread) {}
+        RTensor tC_rSFD;
+        GTensor tC_gSFD;
+        CoordGTensor tC_cSFD;
+        ThrResidue residue_tC_cSFD;
+        TileCoordMN tile_coord_mn;
+        int thread_idx;
+
+        template <class ElementAccumulator, class ElementInput>
+        CUTLASS_DEVICE auto
+        visit(Array<ElementAccumulator, FragmentSize> const&, int, int, int,
+              Array<ElementInput, FragmentSize> const& frg_input) {
+            return frg_input;
+        }
+
+        template <class SmemTensor, class SyncFn, class VTensor>
+        CUTLASS_DEVICE void
+        reduce(SmemTensor&&, SyncFn const&, int epi_m, int epi_n, bool, VTensor visit_results) {
+            // A 16x8 MMA fragment: each thread holds two columns of two rows, a quad holds the
+            // 8 columns of a row, so a 16-value group is two fragments of one quad.
+            static_assert(FragmentSize == 4);
+            constexpr int FragsPerSF = 2;
+            Tensor tC_rSFD_flt = filter_zeros(tC_rSFD);
+            CUTLASS_PRAGMA_UNROLL
+            for (int sf_id = 0; sf_id < size(tC_rSFD_flt); ++sf_id) {
+                auto coord = idx2crd(sf_id, tC_rSFD_flt.shape());
+                const int r0 = get<0,1,1>(coord) * 2;
+                auto row = crd2idx(get<1>(coord), get<1>(tC_rSFD_flt.shape()));
+                const int f0 = crd2idx(get<2>(coord), get<2>(tC_rSFD_flt.shape())) * FragsPerSF;
+                float amax = 0.f;
+                CUTLASS_PRAGMA_UNROLL
+                for (int i = 0; i < FragsPerSF; ++i) {
+                    auto v = visit_results(0, row, f0 + i);
+                    amax = fmaxf(amax, fmaxf(fabsf(v[r0]), fabsf(v[r0 + 1])));
+                }
+                amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+                amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+                const cutlass::float_ue4m3_t qs(fmaxf(amax * (1.f / 6.f), 0x1p-9f));
+                tC_rSFD_flt(coord) = qs;
+                // A divide per value, not one reciprocal per group: the quantizers' x / q is the
+                // full-range divide, and x * (1 / q) differs from it in ~0.06% of nibbles.
+                const float qsf = float(qs);
+                CUTLASS_PRAGMA_UNROLL
+                for (int i = 0; i < FragsPerSF; ++i) {
+                    auto v = visit_results(0, row, f0 + i);
+                    visit_results(0, row, f0 + i)[r0] = v[r0] / qsf;
+                    visit_results(0, row, f0 + i)[r0 + 1] = v[r0 + 1] / qsf;
+                }
+            }
+            if ((thread_idx & 3) == 0 &&
+                elem_less(tC_cSFD(_0{}, _0{}, _0{}, epi_m, epi_n), residue_tC_cSFD))
+                copy_aligned(tC_rSFD, tC_gSFD(_, _, _, _0{}, _0{},
+                                              get<0>(tile_coord_mn) + epi_m,
+                                              get<1>(tile_coord_mn) + epi_n));
+        }
+    };
+
+    template <bool ReferenceSrc, class... Args>
+    CUTLASS_DEVICE auto
+    get_consumer_store_callbacks(ConsumerStoreArgs<Args...> const& args) {
+        auto [m, n, k, l] = args.tile_coord_mnkl;
+        using OutCfg = cutlass::detail::Sm1xxBlockScaledOutputConfig<16>;
+        auto epi_tile_mn = shape<1>(zipped_divide(make_layout(take<0,2>(args.tile_shape_mnk)),
+                                                  args.epi_tile));
+        Tensor mSFD = make_tensor(make_gmem_ptr(this->params_ptr->ptr_scale_factor),
+                                  OutCfg::tile_atom_to_shape_SFD(args.problem_shape_mnkl));
+        Tensor gSFD = local_tile(mSFD, args.epi_tile, make_coord(_, _, l));
+        Tensor tCgSFD = sm90_partition_for_epilogue<ReferenceSrc>(gSFD, args.epi_tile,
+                                                                  args.tiled_copy,
+                                                                  args.thread_idx);
+        Tensor tCrSFD = make_tensor_like<cutlass::float_ue4m3_t>(take<0,3>(cute::layout(tCgSFD)));
+        auto tile_coord_mn = make_coord(m * size<0>(epi_tile_mn), n * size<1>(epi_tile_mn));
+        return ConsumerStoreCallbacks<decltype(tCrSFD), decltype(tCgSFD), decltype(args.tCcD),
+                                      decltype(args.residue_tCcD), decltype(tile_coord_mn)>(
+            cute::move(tCrSFD), cute::move(tCgSFD), args.tCcD, args.residue_tCcD,
+            tile_coord_mn, args.thread_idx);
+    }
+};
+
+struct SiluMulBlockScaleFactor
+    : LinCombBlockScaleFactor<16, cutlass::float_e2m1_t, float, cutlass::float_ue4m3_t,
+                              cutlass::layout::RowMajor, cutlass::bfloat16_t, float> {};
+
+template <int StagesC, int StagesD, int FragmentSize, bool ReuseSmemC, bool DelayTmaStore,
+          class CtaTileShapeMNK, class EpilogueTile>
+using SiluMulBlockScaleFactorEVT = Sm90EVT<
+    FlooredSf16RowStore<EpilogueTile, CtaTileShapeMNK, FragmentSize>,
+    Sm90EVT<Sm90Compute<sparkinfer::kernels::SwigluBf16, float, float,
+                        FloatRoundStyle::round_to_nearest>,
+            Sm90SrcFetch<cutlass::bfloat16_t>,
+            Sm90EVT<Sm90Compute<cutlass::multiplies, float, float,
+                                FloatRoundStyle::round_to_nearest>,
+                    Sm90ScalarBroadcast<float>, Sm90AccFetch>>>;
+
+template <int StagesC, int StagesD, int FragmentSize, bool ReuseSmemC, bool DelayTmaStore,
+          class CtaTileShapeMNK, class EpilogueTile>
+struct FusionCallbacks<
+    epilogue::Sm120TmaWarpSpecialized<StagesC, StagesD, FragmentSize, ReuseSmemC, DelayTmaStore>,
+    SiluMulBlockScaleFactor, CtaTileShapeMNK, EpilogueTile>
+    : SiluMulBlockScaleFactorEVT<StagesC, StagesD, FragmentSize, ReuseSmemC, DelayTmaStore,
+                                 CtaTileShapeMNK, EpilogueTile> {
+    using Impl = SiluMulBlockScaleFactorEVT<StagesC, StagesD, FragmentSize, ReuseSmemC,
+                                            DelayTmaStore, CtaTileShapeMNK, EpilogueTile>;
+    using Operation = SiluMulBlockScaleFactor;
+    struct Arguments {
+        float alpha = 1.f;
+        cutlass::float_ue4m3_t* block_scale_factor_ptr = nullptr;
+        operator typename Impl::Arguments() const {
+            return {{{},                                 // C (the gate)
+                     {{{alpha}, {nullptr}, {}}, {}, {}},  // alpha * acc
+                     {}},                                // SwiGLU
+                    {block_scale_factor_ptr, nullptr, {}}};
+        }
+    };
+    using Impl::Impl;
+};
+} // namespace cutlass::epilogue::fusion
 
 namespace sparkinfer::kernels {
 namespace {
@@ -188,6 +361,36 @@ using NarrowEF = Cfg<Shape<_128, _64, _256>, true>;
 // -- and non-power-of-two tiles fail cute's stride-divisibility and the epilogue's
 // MMA_TILE_M | EPI_TILE_M check, so 256x128x128 is the reachable optimum.
 using BigM = Cfg<Shape<_256, _128, _128>, true>;
+// The up projection with SwiGLU and the down projection's FP4 quantize in its epilogue (see
+// SiluMulBlockScaleFactor above): C is the gate projection's bf16 output, D the FP4 A operand of
+// the down GEMM and the block scales its SFA. Same mainloop as the plain configs.
+template <class TileShape, class Sched = cutlass::gemm::collective::KernelScheduleAuto,
+          class EpiTile = cutlass::epilogue::collective::EpilogueTileAuto>
+struct SwiCfg {
+    using Epilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
+        cutlass::arch::Sm120, cutlass::arch::OpClassBlockScaledTensorOp, TileShape, Cluster,
+        EpiTile, float, float,
+        BF, cutlass::layout::RowMajor, 8, cutlass::float_e2m1_t, cutlass::layout::RowMajor, 32,
+        cutlass::epilogue::collective::EpilogueScheduleAuto,
+        cutlass::epilogue::fusion::SiluMulBlockScaleFactor>::CollectiveOp;
+    using Mainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+        cutlass::arch::Sm120, cutlass::arch::OpClassBlockScaledTensorOp,
+        E4, cutlass::layout::RowMajor, 32, E4, cutlass::layout::ColumnMajor, 32, float,
+        TileShape, Cluster,
+        cutlass::gemm::collective::StageCountAutoCarveout<
+            static_cast<int>(sizeof(typename Epilogue::SharedStorage))>,
+        Sched>::CollectiveOp;
+    using Kernel = cutlass::gemm::kernel::GemmUniversal<
+        Shape<int, int, int, int>, MmaEvictFirstB<Mainloop>, Epilogue, void>;
+    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<Kernel>;
+};
+// The C load makes the epilogue the expensive part of this GEMM, and a whole 128-column row
+// slab per epilogue subtile beats the auto 64x32 one (64x64 sits between; 128x128 and 32x128 do
+// not compile). A 128x128x256 tile and a pingpong 128x128x128 both lost to this one. At m=4096,
+// 5120 -> 17408: up GEMM + swiglu_quant_rows 670 us, this GEMM 588 us, same bytes out.
+using SwiBigM = SwiCfg<Shape<_256, _128, _128>, cutlass::gemm::collective::KernelScheduleAuto,
+                       Shape<_64, _128>>;
+using SwiWide = SwiCfg<Shape<_128, _128, _256>>;
 // Same wide tile, float output. The LM head is the one GEMM in this runtime whose destination is
 // the logit buffer rather than an activation, and logits are float: rounding them to bf16 would
 // put ties into argmax that the Q4_K head it replaces does not have.
@@ -1424,6 +1627,60 @@ bool launch_prefill_nvfp4_gemm(const void* a,const void* sa,const void* b,const 
                                   : run_gemm<WideEF>(a,sa,b,sb,d,m,n,k,ws,st,alpha,c);
     return prefer_narrow(m,n) ? run_gemm<Narrow>(a,sa,b,sb,d,m,n,k,ws,st,alpha,c)
                               : run_gemm<Wide>(a,sa,b,sb,d,m,n,k,ws,st,alpha,c);
+}
+namespace {
+template <class C>
+bool run_swiglu_gemm(const void* a, const void* sa, const void* b, const void* sb,
+                     const void* gate, void* d, void* sf, int m, int n, int k, cudaStream_t st,
+                     float alpha) {
+    using K = typename C::Kernel;
+    auto as = cutlass::make_cute_packed_stride(typename K::StrideA{}, {m,k,1});
+    auto bs = cutlass::make_cute_packed_stride(typename K::StrideB{}, {n,k,1});
+    auto cs = cutlass::make_cute_packed_stride(typename K::StrideC{}, {m,n,1});
+    auto ds = cutlass::make_cute_packed_stride(typename K::StrideD{}, {m,n,1});
+    typename C::Gemm::Arguments ar{};
+    ar.mode = cutlass::gemm::GemmUniversalMode::kGemm;
+    ar.problem_shape = shape(m,n,k);
+    ar.mainloop.ptr_A = static_cast<const cutlass::float_e2m1_t*>(a);
+    ar.mainloop.dA = as;
+    ar.mainloop.ptr_B = static_cast<const cutlass::float_e2m1_t*>(b);
+    ar.mainloop.dB = bs;
+    ar.mainloop.ptr_SFA = static_cast<const cutlass::float_ue4m3_t*>(sa);
+    ar.mainloop.layout_SFA = sfa_layout(m,n,k);
+    ar.mainloop.ptr_SFB = static_cast<const cutlass::float_ue4m3_t*>(sb);
+    ar.mainloop.layout_SFB = sfb_layout(m,n,k);
+    ar.epilogue.ptr_C = static_cast<const BF*>(gate);
+    ar.epilogue.dC = cs;
+    ar.epilogue.ptr_D = static_cast<cutlass::float_e2m1_t*>(d);
+    ar.epilogue.dD = ds;
+    ar.epilogue.thread.alpha = alpha;
+    ar.epilogue.thread.block_scale_factor_ptr = static_cast<cutlass::float_ue4m3_t*>(sf);
+    typename C::Gemm gemm;
+    if (C::Gemm::get_workspace_size(ar) != 0) return false;
+    return gemm.can_implement(ar) == cutlass::Status::kSuccess &&
+           gemm.initialize(ar, nullptr, st) == cutlass::Status::kSuccess &&
+           gemm.run(st, nullptr, false) == cutlass::Status::kSuccess;
+}
+} // namespace
+
+bool prefill_nvfp4_swiglu_epilogue_on() {
+    // Default ON; SPARKINFER_NVFP4_SWIGLU_EPI=0 restores the separate up GEMM + swiglu_quant_rows.
+    static const bool on = [] {
+        const char* e = getenv("SPARKINFER_NVFP4_SWIGLU_EPI");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+bool launch_prefill_nvfp4_gemm_swiglu_quant(const void* a, const void* sa, const void* b,
+                                            const void* sb, const void* gate_bf16,
+                                            void* dst_fp4, void* dst_sf, int m, int n, int k,
+                                            cudaStream_t st, float alpha) {
+    if (!a || !sa || !b || !sb || !gate_bf16 || !dst_fp4 || !dst_sf ||
+        !prefill_nvfp4_supported(m,n,k) || !prefill_nvfp4_supported(m,128,n) || (n & 127))
+        return false;
+    if (nvfp4_big_tile() && m >= 512 &&
+        run_swiglu_gemm<SwiBigM>(a,sa,b,sb,gate_bf16,dst_fp4,dst_sf,m,n,k,st,alpha)) return true;
+    return run_swiglu_gemm<SwiWide>(a,sa,b,sb,gate_bf16,dst_fp4,dst_sf,m,n,k,st,alpha);
 }
 bool launch_prefill_nvfp4_gemm_pdl(const void* a, const void* sa, const void* b, const void* sb,
                                    void* d, int m, int n, int k, void* ws, cudaStream_t st,

@@ -57,6 +57,14 @@ bool launch_prefill_nvfp4_gate_quant_a(const void* src_bf16, const void* gate_bf
 bool launch_prefill_nvfp4_swiglu_quant_a(const void* gate_bf16, const void* up_bf16,
                                          void* dst_fp4, void* dst_sf,
                                          int m, int k, cudaStream_t stream = nullptr);
+// The up projection GEMM with SwiGLU and the down projection's FP4 A quantize in its epilogue:
+// dst = quant(silu(gate_bf16) * (alpha * A.B^T)), dst_sf in the SFA layout of an m x n operand.
+// Returns false (nothing launched) when the shape or the knob declines.
+bool prefill_nvfp4_swiglu_epilogue_on();
+bool launch_prefill_nvfp4_gemm_swiglu_quant(const void* a, const void* sa, const void* b,
+                                            const void* sb, const void* gate_bf16,
+                                            void* dst_fp4, void* dst_sf, int m, int n, int k,
+                                            cudaStream_t stream, float alpha = 1.f);
 bool launch_prefill_nvfp4_quant_b(const void* src_bf16, void* dst_fp4, void* dst_sf,
                                   int n, int k, cudaStream_t stream = nullptr);
 // Rows [n0, n0+rows) of the same `n`-row operand, read from a bf16 buffer holding ONLY those rows
