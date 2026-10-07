@@ -108,6 +108,31 @@ prefill at ctx=128, measured at `d8e1c74`. The eval *scores* PRs on our build an
 *no-regression guard* on the upstream one, which stops an optimisation winning on one checkpoint
 by pessimising the other.
 
+### Fine-tunes: [Swift-Qwen3.8-27B](https://huggingface.co/gittensor-model-hub/Swift-Qwen3.8-27B-NVFP4-RTX5090)
+
+UkisAI's fine-tune of Qwen3.8-27B, quantized with the same ModelOpt recipe as our checkpoint above,
+has an identical tensor layout. It loads and runs at the base model's speed with no flags. The
+server reads the chat template shipped with the checkpoint (`chat_template.jinja`), so Swift's
+history and reasoning-effort rules apply rather than ours. The checkpoint's `tokenizer.json` was
+saved with `truncation.max_length: 512`; the server ignores that setting and logs a warning.
+
+Serving against vLLM 0.30.0 on the same checkpoint, `cells.sh`, output tok/s, sparkinfer / vLLM:
+
+| chat 4 / 16 / 32 requests | 8K prompts 4 / 16 | DFlash2 drafter, 1 / 2 / 4 / 8 | TTFT, 32K / 64K / 120K prompt |
+|---|---|---|---|
+| **327 / 971 / 1,320** vs 271 / 862 / 1,239 | **195 / 310** vs 187 / 305 | **208 / 372 / 575 / 772** vs 182 / 350 / 462 / 455 | **2.47 / 6.11 / 14.6 s** vs 3.11 / 8.47 / 22.3 s |
+
+- **vLLM ran with `--kv-cache-dtype fp8`** (`VL_EXTRA`). The checkpoint's config sets
+  `kv_cache_scheme: "INT8"`, which vLLM cannot use, so by default it falls back to a bf16 cache with
+  half the room: chat 268 / 844 / 1,185 and 8K 169 / 274. The long-prompt and drafter columns used
+  that default.
+- **Accuracy:** teacher-forced over 2,048 held-out tokens, sparkinfer and vLLM agree on the top
+  token as often as they do on base Qwen3.8: 0.876 against 0.885.
+- **DFlash2** was trained on base Qwen3.8 and still speeds Swift up 2.2x at one request. Throughput
+  with it is up to 8% below the base model's.
+- **License:** the Swift Open License v1.0 grants commercial use only to entities under US$1M annual
+  revenue. Check it before deploying.
+
 ### DSpark speculative decode
 
 Qwen3.8-27B also ships a **DSpark** draft — a five-layer semi-autoregressive block drafter that
