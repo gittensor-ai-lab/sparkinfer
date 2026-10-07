@@ -22,6 +22,11 @@ if ROOT not in sys.path:
 
 from ssh_box import ssh_box_enabled, ssh_box_endpoint, ssh_box_arg, vast_enabled
 
+# SPARKINFER_REPORT_ONLY=1: rounds measure and log as usual, but nothing is written to GitHub --
+# every bot and the sync import this module, so this one call covers all of them (report_only.py).
+import report_only
+report_only.install()
+
 # Reuse vast_eval's SSH plumbing for the Qwen3.6 baseline bench (same box, same keys).
 # The bot shells out to vast_eval for the full accuracy-gated Qwen3-30B baseline, but
 # the Qwen3.6 primary only needs a speed sweep — a direct SSH bench is faster.

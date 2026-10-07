@@ -87,6 +87,8 @@ jobs:
             eval/noise_penalty.py \
             eval/test_noise_penalty.py \
             eval/test_copycat_guard.py \
+            eval/report_only.py \
+            eval/test_report_only.py \
             bench/scripts/accuracy_compare_pair.py \
             bench/scripts/accuracy_compare.py
 
@@ -102,5 +104,6 @@ jobs:
           python3 eval/test_cron_wrappers.py
           python3 eval/test_noise_penalty.py
           python3 eval/test_copycat_guard.py
+          python3 eval/test_report_only.py
           # The ban list itself is policy: a malformed line must fail review, not a 3am cron.
           python3 eval/noise_penalty.py --check
