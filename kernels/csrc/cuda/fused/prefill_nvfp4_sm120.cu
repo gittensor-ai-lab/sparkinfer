@@ -2256,6 +2256,22 @@ bool launch_prefill_nvfp4_gemm_swiglu_quant(const void* a, const void* sa, const
         run_swiglu_gemm<SwiBigM>(a,sa,b,sb,gate_bf16,dst_fp4,dst_sf,m,n,k,st,alpha)) return true;
     return run_swiglu_gemm<SwiWide>(a,sa,b,sb,gate_bf16,dst_fp4,dst_sf,m,n,k,st,alpha);
 }
+// Querying a kernel's attributes loads it, as its first launch would. A CUTLASS kernel is large
+// enough that this takes ~11 ms of host time, which a lazy load spent in the middle of the first
+// batched prefill with the GPU idle behind it.
+template <class C>
+void preload_gemm() {
+    cudaFuncAttributes fa;
+    if (cudaFuncGetAttributes(&fa, cutlass::device_kernel<typename C::Kernel>) != cudaSuccess)
+        cudaGetLastError();
+}
+// Only the tiles a continuous batch reaches -- a short batched prefill's (EF) and the packed
+// decode step's (transposed) -- since each loaded kernel holds its code in VRAM: all nine would be
+// ~70 MB, most of it for long-prefill tiles that a sweep's warm-up loads anyway.
+void prefill_nvfp4_preload() {
+    preload_gemm<NarrowEF>(); preload_gemm<WideEF>();
+    preload_gemm<NarrowT>(); preload_gemm<NarrowTP>();
+}
 bool launch_prefill_nvfp4_gemm_pdl(const void* a, const void* sa, const void* b, const void* sb,
                                    void* d, int m, int n, int k, void* ws, cudaStream_t st,
                                    float alpha, const void* c) {

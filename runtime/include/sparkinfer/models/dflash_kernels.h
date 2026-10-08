@@ -201,6 +201,8 @@ void launch_broadcast_rows_i32(const int* src, int* dst, int n, int rows, cudaSt
 // stays valid across row-set changes -- it bakes the array's address, never a session's table.
 void launch_gather_rows_i32(const int* const* row_tables, int* dst, int n, int rows,
                             cudaStream_t stream);
+// Loads this file's module up front (CUDA would load it on the first launch from it).
+void preload_module();
 
 // DSpark's Markov head: a low-rank learned bigram bias, added in place to one row of draft
 // logits. bias[v] = sum_r(w1[prev_token][r] * w2[v][r]) -- w1 is a [verifier_vocab, rank]

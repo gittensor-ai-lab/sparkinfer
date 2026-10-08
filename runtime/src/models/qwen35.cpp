@@ -1239,7 +1239,22 @@ Qwen35Model::Qwen35Model(const Qwen35Config& cfg, KVCacheManager* kv, moe::MoEEn
         d.penalty_counts = p_->penalty_counts_default;   // unconditional -- every model
         d.logit_bias = p_->logit_bias_default;           // unconditional -- every model
         p_->sessions[0] = d;
-    }
+    }    // The packed decode's module, loaded now rather than by its first launch. CUDA loads modules
+    // lazily, and that one's first kernel is the opening gather of the first packed step, so the
+    // load (~50 ms, the GPU idle behind it) landed between a server's first prefill and its first
+    // decode step. SPARKINFER_PRELOAD_DFLASH_MODULE=0 leaves it to the first launch.
+    static const bool preload = [] {
+        const char* e = getenv("SPARKINFER_PRELOAD_DFLASH_MODULE");
+        return !(e && e[0] == '0');
+    }();
+    if (preload) dflash_kernels::preload_module();
+    // Likewise the block-scaled GEMMs, the first of which a lazy load stalled ~11 ms inside the
+    // first batched prefill. SPARKINFER_PRELOAD_NVFP4_GEMM=0 leaves them to their first launch.
+    static const bool preload_gemm = [] {
+        const char* e = getenv("SPARKINFER_PRELOAD_NVFP4_GEMM");
+        return !(e && e[0] == '0');
+    }();
+    if (preload_gemm) kernels::prefill_nvfp4_preload();
 }
 
 Qwen35Model::~Qwen35Model() {

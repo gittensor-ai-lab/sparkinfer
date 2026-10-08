@@ -7,6 +7,9 @@ namespace sparkinfer::kernels {
 
 // Experimental SM120 native block-scaled NVFP4 dense GEMM support.
 bool prefill_nvfp4_supported(int m, int n, int k);
+// Loads the block-scaled GEMM kernels a continuous batch reaches, so none waits for CUDA's lazy load
+// at its first launch. Launches nothing.
+void prefill_nvfp4_preload();
 size_t prefill_nvfp4_data_bytes(int rows, int cols);
 size_t prefill_nvfp4_scale_bytes_a(int m, int k);
 size_t prefill_nvfp4_scale_bytes_b(int n, int k);

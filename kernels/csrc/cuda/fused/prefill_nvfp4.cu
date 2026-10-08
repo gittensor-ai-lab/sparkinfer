@@ -9,6 +9,7 @@
 #ifndef SPARKINFER_BUILD_NVFP4
 namespace sparkinfer::kernels {
 bool prefill_nvfp4_supported(int, int, int) { return false; }
+void prefill_nvfp4_preload() {}
 size_t prefill_nvfp4_data_bytes(int r, int c) { return ((size_t)r * c + 1) / 2; }
 size_t prefill_nvfp4_scale_bytes_a(int, int) { return 0; }
 size_t prefill_nvfp4_scale_bytes_b(int, int) { return 0; }

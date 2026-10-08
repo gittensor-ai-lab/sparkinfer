@@ -2204,6 +2204,12 @@ void launch_gather_rows_i32(const int* const* row_tables, int* dst, int n, int r
         row_tables, dst, n, rows);
 }
 
+void preload_module() {
+    // Querying a kernel's attributes loads its module; nothing is launched.
+    cudaFuncAttributes a;
+    if (cudaFuncGetAttributes(&a, k_gather_rows_i32) != cudaSuccess) cudaGetLastError();
+}
+
 void launch_broadcast_rows_i32(const int* src, int* dst, int n, int rows, cudaStream_t stream) {
     const int total = n * rows;
     if (total <= 0) return;
