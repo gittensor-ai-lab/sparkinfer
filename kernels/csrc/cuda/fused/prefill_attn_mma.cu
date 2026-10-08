@@ -383,7 +383,7 @@ __device__ __forceinline__ void pf_mma_16832(int (&d)[4], const unsigned (&a)[4]
 
 // SINK=false drops the always-attended block 0, giving the PURE sliding window Muse Glimmer's
 // SWA layers use. Defaulted true, so every existing instantiation compiles to what it did before.
-template <int HEAD_DIM, int GROUP_BLKS, int RQH, int PLANES = 0, bool VT = false, bool WIDEK = false, int PVU = 1,
+template <int HEAD_DIM, int GROUP_BLKS, int RQH, int PLANES = 0, int VT = 0, bool WIDEK = false, int PVU = 1,
           bool SINK = true>
 __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 ? 2 : 1))) void pf_attn_mma_gqa_kernel(
     const __nv_bfloat16* __restrict__ q, const signed char* __restrict__ k_pool,
@@ -452,6 +452,14 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
     static_assert(!WIDEK || (HEAD_DIM == 256 && SPL != RQH),
                   "WIDEK needs head_dim 256 and the rolling score plane");
     constexpr int SBLK = (SPL * BM * SPLD > BM * HEAD_DIM) ? SPL * BM * SPLD : BM * HEAD_DIM;
+    // Heads per PV pass. One pass holds RQH x 2 x 4 int32 accumulators beside the RQH x 8 float
+    // output fragments, and at RQH = 6 that pair alone is 96 of the 128 registers a 512-thread
+    // block gets: the six-head tier spilled 192-320 bytes of stack in its group loop (ptxas, CUDA
+    // 12.8 and 13.0 alike). On the pair plane a lane's V for a page pair is one 16-byte load, so
+    // walking the pairs twice, three heads at a time, costs eight more loads a group and halves
+    // the accumulators. Each head's int32 sums are formed over the same pages in the same order,
+    // so the output is bit-identical.
+    constexpr int PVH = (VT == 2 && RQH % 2 == 0 && RQH > 2) ? RQH / 2 : RQH;
     float* s_s  = reinterpret_cast<float*>(s_pi + (size_t)RQH * BM * pld); // [SPL][BM][SPLD]
     float* s_o  = s_s;                                               // [BM][HEAD_DIM] epilogue landing
     // The K and V dequant scales arrive as __half and are only ever multiplied into a float, so
@@ -928,20 +936,28 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
             // so the odd page reads 16 columns past the group -- which the zero B discards.
             #pragma unroll
             for (int dd = 0; dd < DPW; dd++) {
+              #pragma unroll
+              for (int hb = 0; hb < RQH; hb += PVH) {
                 const int dt = warp * DPW + dd;
-                int cf[RQH][2][4];
+                int cf[PVH][2][4];
                 #pragma unroll
-                for (int h = 0; h < RQH; h++)
+                for (int h = hb; h < hb + PVH; h++)
                     #pragma unroll
                     for (int n2 = 0; n2 < 2; n2++)
                         #pragma unroll
-                        for (int j = 0; j < 4; j++) cf[h][n2][j] = 0;
+                        for (int j = 0; j < 4; j++) cf[h - hb][n2][j] = 0;
                 // Row (l&3)*4 of the page, dim pair 2*(l>>2) of this warp's 16-dim slab: the
                 // B operand's k index is the key and its n index the dim, both fixed per lane.
                 // The packed plane's lane map: a lane's four keys are four CONSECUTIVE bytes at
                 // [dim][key], and its two n-halves are adjacent dim rows 16 B apart -- so the two
                 // loads that feed one page cover one whole 32-byte sector between them.
                 constexpr size_t VTLD = (size_t)HEAD_DIM * 16;   // one page of one kv-head, packed
+                // VT == 2: one page PAIR of one kv-head, packed, and this lane's 16 bytes in it --
+                // dims dt*16 + 2*(lane>>2) and +1, keys (lane&3)*4..+3 of both pages. A pair is
+                // pages (lb0, lb0 + 1) with lb0 = k0/16 + ks; the caller takes this layout only
+                // with no sliding window, where k0 steps from 0 by GN, so lb0 is always even.
+                constexpr size_t VPLD = (size_t)HEAD_DIM * 32;
+                const size_t vplane = ((size_t)(dt * 8 + (lane >> 2)) * 4 + (lane & 3)) * 16;
                 const int gpair = gblk & ~1;
                 // PVU=2 keeps TWO page pairs of V in flight. The pair loop's trip count is a
                 // runtime bound, so at PVU=1 ptxas has exactly one iteration's four operand loads
@@ -960,7 +976,13 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
                     // d+8, eight bytes apart. Mapping n-half h to dims {2c+h} instead makes a
                     // lane's two dims ADJACENT, which is what the paged gather below relies on.
                     unsigned B0[2], B1[2];
-                    if constexpr (VT) {
+                    if constexpr (VT == 2) {
+                        // One 16-byte load: the pair plane (pf_v_pack_pairs_kernel) holds this
+                        // lane's four operand words for the pair side by side, in B0/B1 order.
+                        const uint4 w = *reinterpret_cast<const uint4*>(
+                            vT + ((size_t)(lb0 >> 1) * n_kv_heads + kvh) * VPLD + vplane);
+                        B0[0] = w.x; B1[0] = w.y; B0[1] = w.z; B1[1] = w.w;
+                    } else if constexpr (VT) {
                         // Four plain loads. The plane already holds the operand in order, so
                         // there is no gather across KVLD and no byte_perm chain to rebuild it,
                         // and the two loads of a page cover one whole 32-byte sector between
@@ -1001,11 +1023,11 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
                         B1[1] = __byte_perm(c0, c1, 0x7632);
                     }
                     #pragma unroll
-                    for (int h = 0; h < RQH; h++) {
+                    for (int h = hb; h < hb + PVH; h++) {
                         unsigned a[4];
                         pf_ldsm_x4(a, pi_base + (unsigned)(h * BM * pld + ks * 16));
-                        pf_mma_16832(cf[h][0], a, B0[0], B1[0]);
-                        pf_mma_16832(cf[h][1], a, B0[1], B1[1]);
+                        pf_mma_16832(cf[h - hb][0], a, B0[0], B1[0]);
+                        pf_mma_16832(cf[h - hb][1], a, B0[1], B1[1]);
                     }
                 }
                 // A group holds an odd page only where the causal bound cuts it -- once per
@@ -1015,7 +1037,14 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
                 if (gblk & 1) {
                     const int lbt = (k0 / BLKSZ) + gpair;
                     unsigned Bt[2];
-                    if constexpr (VT) {
+                    if constexpr (VT == 2) {
+                        // lbt is even (see vplane), so the page is the first of its pair: the
+                        // pair's page-0 words. The partner page's words are never read.
+                        const unsigned* w = reinterpret_cast<const unsigned*>(
+                            vT + ((size_t)(lbt >> 1) * n_kv_heads + kvh) * VPLD + vplane);
+                        Bt[0] = w[0];
+                        Bt[1] = w[2];
+                    } else if constexpr (VT) {
                         const size_t vtlane =
                             (size_t)(dt * 16 + 2 * (lane >> 2)) * 16 + (lane & 3) * 4;
                         const signed char* vt0 = vT + ((size_t)lbt * n_kv_heads + kvh) * VTLD + vtlane;
@@ -1036,24 +1065,25 @@ __global__ __launch_bounds__(GROUP_BLKS * 32, (GROUP_BLKS >= 16 ? 1 : (RQH <= 3 
                         Bt[1] = __byte_perm(a0, a1, 0x7632);
                     }
                     #pragma unroll
-                    for (int h = 0; h < RQH; h++) {
+                    for (int h = hb; h < hb + PVH; h++) {
                         unsigned a[4];
                         pf_ldsm_x4(a, pi_base + (unsigned)(h * BM * pld + gpair * 16));
-                        pf_mma_16832(cf[h][0], a, Bt[0], 0u);
-                        pf_mma_16832(cf[h][1], a, Bt[1], 0u);
+                        pf_mma_16832(cf[h - hb][0], a, Bt[0], 0u);
+                        pf_mma_16832(cf[h - hb][1], a, Bt[1], 0u);
                     }
                 }
                 #pragma unroll
-                for (int h = 0; h < RQH; h++) {
+                for (int h = hb; h < hb + PVH; h++) {
                     const float ps_lo = s_ps[h * BM + rlo],   ps_hi = s_ps[h * BM + rhi];
                     const float cr_lo = s_corr[h * BM + rlo], cr_hi = s_corr[h * BM + rhi];
                     #pragma unroll
                     for (int e = 0; e < 8; e++) {
                         const bool up = (hi_mask >> e) & 1u;
-                        ofr[h][dd][e] = __fmaf_rn((float)cf[h][e >> 2][e & 3], up ? ps_hi : ps_lo,
+                        ofr[h][dd][e] = __fmaf_rn((float)cf[h - hb][e >> 2][e & 3], up ? ps_hi : ps_lo,
                                                   __fmul_rn(ofr[h][dd][e], up ? cr_hi : cr_lo));
                     }
                 }
+              }
             }
         }
     }
@@ -1156,6 +1186,64 @@ __global__ void pf_v_pack_kernel(const signed char* __restrict__ v_pool,
     for (int j = 0; j < 16; j++) buf[j] = src[(size_t)j * KVLD];
     signed char* dst = vT + (((size_t)lb * n_kv_heads + kvh) * head_dim + d) * 16;
     *reinterpret_cast<int4*>(dst) = *reinterpret_cast<const int4*>(buf);
+}
+
+// The same repack one step further: [page pair][kv head][dim pair][lane & 3][4 words]. A lane's
+// operand for one page pair is four words -- dims 2c and 2c+1, keys 4j..4j+3, of both pages --
+// which the per-page plane holds as four separate 4-byte loads, each in a different 16-byte row.
+// Here they are one 16-byte vector in the order the mma takes them, so the PV loop issues one
+// LDG.128 per page pair where it issued four LDG.32, and a warp's 32 lanes read 512 consecutive
+// bytes. The same bytes feed the same mma operand registers, so every P'V product is unchanged.
+// One block per (page pair, kv head); one thread per (dim pair, lane & 3). For a fixed key a
+// warp's threads read 8 consecutive dim pairs, i.e. 16 consecutive bytes of the key row. A pair
+// whose second page is past the plane (an odd page count) is zero-filled there; the attention
+// kernel never multiplies those words by anything but the zero B operand of its odd-page tail.
+__global__ void pf_v_pack_pairs_kernel(const signed char* __restrict__ v_pool,
+                                       const int* __restrict__ block_table,
+                                       signed char* __restrict__ vP, int n_blk, int n_kv_heads,
+                                       int head_dim) {
+    const int pp = blockIdx.x, kvh = blockIdx.y;
+    const int dp = threadIdx.x >> 2, j = threadIdx.x & 3;
+    const size_t KVLD = (size_t)n_kv_heads * head_dim;
+    unsigned w[2][2];   // [dim parity][page]
+    #pragma unroll
+    for (int pg = 0; pg < 2; pg++) {
+        const int lb = 2 * pp + pg;
+        unsigned lo = 0u, hi = 0u;
+        if (lb < n_blk) {
+            const signed char* src = v_pool + ((size_t)block_table[lb] * 16 * n_kv_heads + kvh) *
+                                     head_dim + 2 * dp + (size_t)(4 * j) * KVLD;
+            #pragma unroll
+            for (int i = 0; i < 4; i++) {
+                const unsigned v = *reinterpret_cast<const unsigned short*>(src + (size_t)i * KVLD);
+                lo |= (v & 0xFFu) << (8 * i);
+                hi |= (v >> 8) << (8 * i);
+            }
+        }
+        w[0][pg] = lo;
+        w[1][pg] = hi;
+    }
+    *reinterpret_cast<uint4*>(vP + ((((size_t)pp * n_kv_heads + kvh) * (head_dim / 2) + dp) * 4 + j) *
+                                       16) = make_uint4(w[0][0], w[0][1], w[1][0], w[1][1]);
+}
+
+// Builds the pair plane for this pass (as vpack_build builds the per-page one), or returns
+// nullptr to keep the caller on the per-page plane. SPARKINFER_PREFILL_ATTN_VPACK_PAIRS=0
+// disables it (A/B in ONE binary).
+const signed char* vpack_pairs_build(const signed char* v_pool, const int* block_table,
+                                     int n_blk, int n_kv_heads, int head_dim, cudaStream_t stream) {
+    static const bool on = [] {
+        const char* e = getenv("SPARKINFER_PREFILL_ATTN_VPACK_PAIRS");
+        return !(e && e[0] == '0');
+    }();
+    if (!on || n_blk <= 0 || head_dim <= 0 || (head_dim & 1) || head_dim * 2 > 1024) return nullptr;
+    const int n_pairs = (n_blk + 1) / 2;
+    const size_t bytes = (size_t)n_pairs * n_kv_heads * head_dim * 32;
+    if (!vpack_reserve(bytes)) return nullptr;
+    pf_v_pack_pairs_kernel<<<dim3(n_pairs, n_kv_heads), head_dim * 2, 0, stream>>>(
+        v_pool, block_table, reinterpret_cast<signed char*>(g_vpack), n_blk, n_kv_heads, head_dim);
+    if (cudaPeekAtLastError() != cudaSuccess) { cudaGetLastError(); return nullptr; }
+    return reinterpret_cast<const signed char*>(g_vpack);
 }
 
 // Returns the packed plane for this pass, or nullptr to keep the caller on the paged loads.
@@ -1632,7 +1720,7 @@ bool launch_prefill_attn_fa_muse(
     return cudaPeekAtLastError() == cudaSuccess;
 }
 
-template <int HD, int GROUP_BLKS, int RQH, int PLANES = 0, bool VT = false, bool WIDEK = false, int PVU = 1,
+template <int HD, int GROUP_BLKS, int RQH, int PLANES = 0, int VT = 0, bool WIDEK = false, int PVU = 1,
           bool SINK = true>
 static bool launch_attn_gqa(const void* q, const signed char* k_pool, const signed char* v_pool,
                             const void* k_scale, const void* v_scale, const int* block_table,
@@ -1858,10 +1946,14 @@ bool launch_prefill_attn_mma(
     // Smallest KV span (prefix + this pass's queries) that takes the six-head tier below.
     // 0 disables it and restores the RQH=3 tier everywhere.
     // 65536 restores the previous floor (A/B in ONE binary): 16k/32k stay on RQH=3, only
-    // the 256k windows that already cleared L2 take six heads.
+    // the 256k windows that already cleared L2 take six heads. 16384 restores the floor before
+    // the pair plane (see vpack_pairs_build), which kept 4k on RQH=3; on the pair plane the six-head
+    // tier is ahead there too, with the same output bytes: one 24q/4kv hd256 layer at 4096 tokens
+    // 0.861 -> 0.654 ms, at 2048 0.253 -> 0.209 ms (RTX 5090). The tier's own n_tokens >= 2048
+    // floor still keeps every shorter pass, and every packed-decode width, where they were.
     static const long wide_minkeys = [] {
         const char* e = getenv("SPARKINFER_PREFILL_ATTN_GQA6_MINKEYS");
-        const long v = e ? atol(e) : 16384;
+        const long v = e ? atol(e) : 2048;
         return v < 0 ? 0 : v;
     }();
     // The six-head tier's operand issue path: permuted k axis + 16-byte-per-lane K operand load,
@@ -1952,6 +2044,22 @@ bool launch_prefill_attn_mma(
         (long)q_pos0 + n_tokens >= wide_minkeys && n_tokens >= 2048 && gqa_gb >= 16) {
         // Every key this pass reads lives below q_pos0 + n_tokens, so that is the plane.
         const int n_blk = (q_pos0 + n_tokens + 15) / 16;
+        // The pair plane wants page pairs aligned to even pages, which holds when the key loop
+        // starts at 0 and steps by GN -- every full-attention pass. A sliding window's range can
+        // start on an odd page, so a windowed pass keeps the per-page plane. With the pair plane's
+        // one load a pair and the two-pass PV (PVH) freeing registers, four page pairs in flight
+        // (PVU=4) is ahead of two: one 16384-token window over 32768 keys, 24.9 -> 24.0 ms.
+        // SPARKINFER_PREFILL_ATTN_VPACK_PAIRS=0 keeps the per-page plane (A/B in ONE binary).
+        const signed char* vp = win_blocks <= 0
+            ? vpack_pairs_build(v_pool, block_table, n_blk, n_kv_heads, HD, stream) : nullptr;
+        if (vp && (wide_k
+                ? launch_attn_gqa<HD, 16, 6, 2, 2, true, 4>(q, k_pool, v_pool, k_scale, v_scale,
+                      block_table, attn, n_tokens, n_q_heads, n_kv_heads, block_size,
+                      max_blocks_per_seq, scale, win_blocks, stream, q_pos0, vp)
+                : launch_attn_gqa<HD, 16, 6, 2, 2, false, 1>(q, k_pool, v_pool, k_scale, v_scale,
+                      block_table, attn, n_tokens, n_q_heads, n_kv_heads, block_size,
+                      max_blocks_per_seq, scale, win_blocks, stream, q_pos0, vp)))
+            return true;
         const signed char* vt =
             vpack_build(v_pool, block_table, n_blk, n_kv_heads, HD, stream);
         if (vt && (wide_k
