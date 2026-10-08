@@ -61,6 +61,8 @@ struct GdnVFold {
 // once each get their own. prep_done (optional) is recorded on `stream` between the first prep
 // kernel and its scan. scan_trigger: the scan lets a programmatic launch after it start at once
 // (it must not read the scan's output before its own grid-dependency wait).
+// prep_overlap lets the scan run beside its chunk prep (see run_slice): for a one-prompt pass
+// only, as the caller knows it -- no decode rows, no packed segments -- and not with scan_trigger.
 bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
                               const void* alpha, const void* beta,
                               const void* dt, const void* a,
@@ -69,7 +71,8 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
                               bool qh_block, cudaStream_t stream = nullptr,
                               bool carry_in = false, int slot = 0,
                               cudaEvent_t prep_done = nullptr,
-                              const GdnVFold* vfold = nullptr, bool scan_trigger = false);
+                              const GdnVFold* vfold = nullptr, bool scan_trigger = false,
+                              bool prep_overlap = false);
 
 }  // namespace kernels
 }  // namespace sparkinfer
