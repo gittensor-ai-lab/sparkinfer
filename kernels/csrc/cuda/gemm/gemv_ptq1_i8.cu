@@ -48,6 +48,20 @@ __device__ __forceinline__ void pdl_wait() {
     cudaGridDependencySynchronize();
 #endif
 }
+// A constant operand (the checkpoint's) fetched before pdl_wait, as a plain ld.global in a volatile
+// asm so it is issued where it is written. ptxas schedules an ld.global.nc across the wait in
+// either direction, so these are not __ldg, and the inputs the launch before writes are not
+// __restrict__ in a kernel that reads anything before its wait.
+__device__ __forceinline__ unsigned ld_pre_wait(const void* p) {
+    unsigned v;
+    asm volatile("ld.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+    return v;
+}
+__device__ __forceinline__ uint2 ld2_pre_wait(const void* p) {
+    uint2 v;
+    asm volatile("ld.global.v2.u32 {%0, %1}, [%2];" : "=r"(v.x), "=r"(v.y) : "l"(p) : "memory");
+    return v;
+}
 // Byte offset of the ue4m3 scale for (row r, 16-value group g) in the CUTLASS sm1xx block-scaled
 // layout (launch_ct_nvfp4_pack_sfb / launch_nvfp4_pack_sfa's target): 128-row x 4-group atoms of
 // 512 bytes, the K atoms fastest; inside one, row r%32 strides 16, r%128/32 strides 4, g%4 is 1.
@@ -79,11 +93,13 @@ __device__ __forceinline__ unsigned e2m1x2_rn(float x, float y) {
 // each: bits 0-1 of the in-span index are the value, bits 2-6 the lane, bits 7-9 the warp, so the
 // ten butterfly stages are two in registers, five across lanes and three across warps. Each warp
 // then owns exactly one 128-value quantization block.
-__device__ __forceinline__ void ld4_bf16(const __nv_bfloat16* p, float v[4]) {
-    const uint2 raw = *reinterpret_cast<const uint2*>(p);
+__device__ __forceinline__ void bf16x4_f(uint2 raw, float v[4]) {
     const __nv_bfloat162 a = *reinterpret_cast<const __nv_bfloat162*>(&raw.x);
     const __nv_bfloat162 b = *reinterpret_cast<const __nv_bfloat162*>(&raw.y);
     v[0] = __low2float(a); v[1] = __high2float(a); v[2] = __low2float(b); v[3] = __high2float(b);
+}
+__device__ __forceinline__ void ld4_bf16(const __nv_bfloat16* p, float v[4]) {
+    bf16x4_f(*reinterpret_cast<const uint2*>(p), v);
 }
 
 // What is rotated, each rounded to bf16 exactly as the kernel it replaces writes it (every
@@ -104,7 +120,7 @@ enum : int { kRotPlain = 0, kRotSwiglu = 1, kRotGnorm = 2, kRotGate = 3, kRotAdd
 struct i8_blk_q8_1 { __half2 ds; signed char qs[32]; };
 template <int MODE>
 __global__ void __launch_bounds__(256)
-ptq1_rotq_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ u,
+ptq1_rotq_kernel(const __nv_bfloat16* x, const __nv_bfloat16* u,   // the launch before's
                  const __nv_bfloat16* __restrict__ nw, float eps,
                  const signed char* __restrict__ sign, signed char* __restrict__ q,
                  float* __restrict__ qd, int* __restrict__ qs, int k,
@@ -112,12 +128,19 @@ ptq1_rotq_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __res
                  __nv_bfloat16* __restrict__ out_norm = nullptr,
                  i8_blk_q8_1* __restrict__ out_q8 = nullptr) {
     __shared__ float sh[kSpan];
-    pdl_wait();      // launched programmatic (rotq_launch): x and u are the kernel before's output
-    pdl_trigger();   // the rows kernel after this may start fetching its weights
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
     const long row = blockIdx.y;
     const int e0 = blockIdx.x * kSpan + t * 4;
     const size_t off = (size_t)row * k + e0;
+    // The signs and the norm weight are the checkpoint's: fetched before the wait, they are not a
+    // memory round trip of their own once the kernel before drains (the signs were one after the
+    // norm's barrier).
+    const unsigned sgw = ld_pre_wait(sign + e0);
+    float wv[4];
+    if (MODE == kRotGnorm) bf16x4_f(ld2_pre_wait(nw + lane * 4), wv);
+    if (MODE == kRotAddNorm) bf16x4_f(ld2_pre_wait(nw + e0), wv);
+    pdl_wait();      // launched programmatic (rotq_launch): x and u are the kernel before's output
+    pdl_trigger();   // the rows kernel after this may start fetching its weights
     float v[4];
     ld4_bf16(x + off, v);
     if (MODE == kRotSwiglu) {
@@ -143,13 +166,12 @@ ptq1_rotq_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __res
 #pragma unroll
         for (int m = 16; m > 0; m >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, m);
         const float inv = rsqrtf(ss / kBlk + eps);
-        float z[4], w[4];
+        float z[4];
         ld4_bf16(u + off, z);
-        ld4_bf16(nw + lane * 4, w);
 #pragma unroll
         for (int i = 0; i < 4; ++i)
             v[i] = __bfloat162float(
-                __float2bfloat16(v[i] * inv * w[i] * (z[i] / (1.f + __expf(-z[i])))));
+                __float2bfloat16(v[i] * inv * wv[i] * (z[i] / (1.f + __expf(-z[i])))));
     } else if (MODE == kRotAddNorm) {
         __shared__ float s_warp[32];
         const int nvw = k / 256;                  // add_rmsnorm2_q8's warps: k/8 threads
@@ -160,11 +182,10 @@ ptq1_rotq_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __res
 #pragma unroll
         for (int i = 0; i < kVw; ++i) {
             const int vw = warp + 8 * i;
-            if (vw < nvw) { xp[i] = __ldg(x8 + vw * 32 + lane); rp[i] = __ldg(r8 + vw * 32 + lane); }
+            if (vw < nvw) { xp[i] = x8[vw * 32 + lane]; rp[i] = r8[vw * 32 + lane]; }
         }
-        float rv[4], wv[4];
+        float rv[4];
         ld4_bf16(u + off, rv);
-        ld4_bf16(nw + e0, wv);
 #pragma unroll
         for (int i = 0; i < kVw; ++i) {
             const int vw = warp + 8 * i;
@@ -225,7 +246,7 @@ ptq1_rotq_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __res
             if ((t & 7) == 0) blk->ds = __floats2half2_rn(d, d * (float)s8);
         }
     }
-    const char4 sg = *reinterpret_cast<const char4*>(sign + e0);
+    const char4 sg = *reinterpret_cast<const char4*>(&sgw);
     v[0] *= (float)sg.x; v[1] *= (float)sg.y; v[2] *= (float)sg.z; v[3] *= (float)sg.w;
     // bits 0 and 1
     float a0 = v[0] + v[1], a1 = v[0] - v[1], a2 = v[2] + v[3], a3 = v[2] - v[3];

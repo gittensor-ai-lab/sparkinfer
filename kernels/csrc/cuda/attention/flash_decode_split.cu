@@ -1456,9 +1456,14 @@ __global__ void __launch_bounds__(fa_mma_block_threads<HEAD_DIM, GQA>::v,
         const int* s_si = reinterpret_cast<const int*>(s_s);
 
         // Online softmax; fold V scale into P', quantize P' per-row into s_pi.
+        // The 6:1 group's real rows are 0..5 of the 16 the mma pads to: one a warp, on warps 0..5,
+        // and the pad rows not at all (their P' rows feed only accumulator rows that are never
+        // folded into O). Each real row's arithmetic is the two-rows-a-warp form's, lane for lane.
+        constexpr bool kRowPerWarp = kWide && GQA <= 8;
         #pragma unroll
-        for (int rr = 0; rr < 2; rr++) {
-            const int r = warp * 2 + rr;
+        for (int rr = 0; rr < (kRowPerWarp ? 1 : 2); rr++) {
+            const int r = kRowPerWarp ? warp : warp * 2 + rr;
+            if (kRowPerWarp && r >= GQA) break;
             // Cache this lane's 4 scaled QK scores (t = lane + u*32) once, reuse for max AND exp —
             // avoids reading s_si + re-applying the 3 scales twice. Invalid/masked positions get the
             // -inf sentinel so they drop out of the max and yield p=0 in the exp (no s_vs garbage read).

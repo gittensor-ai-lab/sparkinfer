@@ -60,6 +60,13 @@ __device__ __forceinline__ void q36_pdl_wait() {
     cudaGridDependencySynchronize();
 #endif
 }
+// A bf16 read before q36_pdl_wait, as a plain ld.global in a volatile asm so it is issued where it
+// is written (ptxas schedules an ld.global.nc across the wait in either direction).
+__device__ __forceinline__ __nv_bfloat16 q36_ld_bf16_pre_wait(const __nv_bfloat16* p) {
+    unsigned short v;
+    asm volatile("ld.global.u16 %0, [%1];" : "=h"(v) : "l"(p) : "memory");
+    return __ushort_as_bfloat16(v);
+}
 
 __global__ void split_q_gate_kernel(const __nv_bfloat16* __restrict__ qg,
                                     __nv_bfloat16* __restrict__ q,
@@ -321,12 +328,14 @@ __global__ void gdn_ar_kernel(const __nv_bfloat16* __restrict__ q,
 // cosmetic: under SB16 the slot offset has to be counted in bf16 elements, and a caller that
 // pre-applied it to the float* pointer instead landed every slot but the first at twice its
 // byte offset -- correct output from layer 0 and silent garbage from the other 47.
+// q, k, v, alpha and beta are the launches before's output, so not __restrict__: the kernel reads
+// its state and dt / A before the wait, and an ld.global.nc of them could be scheduled above it.
 template <int COLS, int HEAD_DIM, bool SB16, bool SI8 = false>
-__global__ void gdn_ar_fast_kernel(const __nv_bfloat16* __restrict__ q,
-                                   const __nv_bfloat16* __restrict__ k,
-                                   const __nv_bfloat16* __restrict__ v,
-                                   const __nv_bfloat16* __restrict__ alpha,
-                                   const __nv_bfloat16* __restrict__ beta,
+__global__ void gdn_ar_fast_kernel(const __nv_bfloat16* q,
+                                   const __nv_bfloat16* k,
+                                   const __nv_bfloat16* v,
+                                   const __nv_bfloat16* alpha,
+                                   const __nv_bfloat16* beta,
                                    const __nv_bfloat16* __restrict__ dt,
                                    const __nv_bfloat16* __restrict__ a,
                                    float* __restrict__ state,   // TRANSPOSED [vh][col][row]
@@ -358,10 +367,12 @@ __global__ void gdn_ar_fast_kernel(const __nv_bfloat16* __restrict__ q,
         const int i = lane + r * 32;
         sloc[r] = SI8 ? (float)colq[i] * qsc : SB16 ? q36_to_f(colb[i]) : col[i];   // coalesced read
     }
+    // dt and A are the checkpoint's: read before the wait too.
+    const float dtv = q36_to_f(q36_ld_bf16_pre_wait(dt + vh)), av = q36_to_f(q36_ld_bf16_pre_wait(a + vh));
     q36_pdl_wait();
     q36_pdl_trigger();
     const float bb = q36_sigmoid(q36_to_f(beta[vh]));
-    const float g  = __expf(q36_softplus(q36_to_f(alpha[vh]) + q36_to_f(dt[vh])) * q36_to_f(a[vh]));
+    const float g  = __expf(q36_softplus(q36_to_f(alpha[vh]) + dtv) * av);
     float part_sk = 0.f;
     #pragma unroll
     for (int r = 0; r < NROW; r++) {
@@ -1131,8 +1142,14 @@ __global__ void conv_split_l2norm_fused_kernel(
 // (launch_gemm_ptq1_i8_row_partials) instead of the reduced qkv: each thread sums its channel's
 // splits in split order and rounds to bf16 exactly as ptq1_split_reduce_kernel writes qkv, so the
 // conv, the state update and the norms see the same values -- and the reduce launch goes.
+//
+// TAPS is conv_kernel when it is known at compile time (0: read from conv_kernel). Then the conv
+// weights and the channel's conv state are read before the wait, and only the partials after it.
+// The state is this kernel's own, like gdn_ar_fast_kernel's: its launch one token earlier wrote
+// it. The partials are not __restrict__: an ld.global.nc of them could be scheduled above the wait.
+template <int TAPS>
 __global__ void conv_split_l2norm_part_kernel(
-    const float* __restrict__ part, int splits,
+    const float* part, int splits,
     const __nv_bfloat16* __restrict__ conv_w,
     __nv_bfloat16* __restrict__ conv_state,
     __nv_bfloat16* __restrict__ q,
@@ -1141,7 +1158,6 @@ __global__ void conv_split_l2norm_part_kernel(
     int q_heads, int v_heads, int head_dim, int conv_kernel, float eps)
 {
     q36_pdl_trigger();
-    q36_pdl_wait();
     const int h  = blockIdx.x;
     const int t  = threadIdx.x;
     const int q_dim = q_heads * head_dim;
@@ -1160,21 +1176,41 @@ __global__ void conv_split_l2norm_part_kernel(
     }
     if (d >= qkv_dim) return;
 
+    constexpr int kPre = TAPS > 0 ? TAPS : 1;
+    __nv_bfloat16 cw[kPre], cs[kPre];
+    if (TAPS > 0) {
+#pragma unroll
+        for (int p = 0; p < TAPS; p++) {
+            cw[p] = q36_ld_bf16_pre_wait(conv_w + (size_t)d * TAPS + p);
+            if (p < TAPS - 1) cs[p] = q36_ld_bf16_pre_wait(conv_state + (size_t)p * qkv_dim + d);
+        }
+    }
+    q36_pdl_wait();
+
     float a = part[d];
     for (int sp = 1; sp < splits; ++sp) a = __fadd_rn(a, part[(size_t)sp * qkv_dim + d]);
     const __nv_bfloat16 xd = __float2bfloat16(a);
 
     // 1D conv + SiLU
     float y = 0.f;
-    for (int p = 0; p < conv_kernel - 1; p++)
-        y += q36_to_f(conv_state[(size_t)p * qkv_dim + d]) *
-             q36_to_f(conv_w[(size_t)d * conv_kernel + p]);
-    y += q36_to_f(xd) * q36_to_f(conv_w[(size_t)d * conv_kernel + (conv_kernel - 1)]);
+    if (TAPS > 0) {
+#pragma unroll
+        for (int p = 0; p < TAPS - 1; p++) y += q36_to_f(cs[p]) * q36_to_f(cw[p]);
+        y += q36_to_f(xd) * q36_to_f(cw[TAPS - 1]);
+#pragma unroll
+        for (int p = 0; p < TAPS - 2; p++) conv_state[(size_t)p * qkv_dim + d] = cs[p + 1];
+        if (TAPS > 1) conv_state[(size_t)(TAPS - 2) * qkv_dim + d] = xd;
+    } else {
+        for (int p = 0; p < conv_kernel - 1; p++)
+            y += q36_to_f(conv_state[(size_t)p * qkv_dim + d]) *
+                 q36_to_f(conv_w[(size_t)d * conv_kernel + p]);
+        y += q36_to_f(xd) * q36_to_f(conv_w[(size_t)d * conv_kernel + (conv_kernel - 1)]);
 
-    for (int p = 0; p < conv_kernel - 2; p++)
-        conv_state[(size_t)p * qkv_dim + d] = conv_state[(size_t)(p + 1) * qkv_dim + d];
-    if (conv_kernel > 1)
-        conv_state[(size_t)(conv_kernel - 2) * qkv_dim + d] = xd;
+        for (int p = 0; p < conv_kernel - 2; p++)
+            conv_state[(size_t)p * qkv_dim + d] = conv_state[(size_t)(p + 1) * qkv_dim + d];
+        if (conv_kernel > 1)
+            conv_state[(size_t)(conv_kernel - 2) * qkv_dim + d] = xd;
+    }
 
     const float oy = q36_silu(y);
 
@@ -1295,7 +1331,8 @@ void launch_qwen36_conv_split_l2norm_part(
     la.val.programmaticStreamSerializationAllowed = 1;
     lc.attrs = &la;
     lc.numAttrs = pdl ? 1 : 0;
-    cudaLaunchKernelEx(&lc, conv_split_l2norm_part_kernel, part, splits,
+    cudaLaunchKernelEx(&lc, conv_kernel == 4 ? conv_split_l2norm_part_kernel<4>
+                                             : conv_split_l2norm_part_kernel<0>, part, splits,
         reinterpret_cast<const __nv_bfloat16*>(conv_w_bf16),
         reinterpret_cast<__nv_bfloat16*>(conv_state_bf16),
         reinterpret_cast<__nv_bfloat16*>(q_bf16),

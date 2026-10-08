@@ -31,6 +31,20 @@ __device__ __forceinline__ void dp_pdl_wait() {
     cudaGridDependencySynchronize();
 #endif
 }
+// A constant operand (the checkpoint's) fetched before dp_pdl_wait, as a plain ld.global in a
+// volatile asm so it is issued where it is written. ptxas schedules an ld.global.nc across the
+// wait in either direction, so these are not __ldg, and the inputs the launch before writes are
+// not __restrict__ in a kernel that reads anything before its wait.
+__device__ __forceinline__ unsigned dp_ld_pre_wait(const void* p) {
+    unsigned v;
+    asm volatile("ld.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+    return v;
+}
+__device__ __forceinline__ uint2 dp_ld2_pre_wait(const void* p) {
+    uint2 v;
+    asm volatile("ld.global.v2.u32 {%0, %1}, [%2];" : "=r"(v.x), "=r"(v.y) : "l"(p) : "memory");
+    return v;
+}
 
 // Which carrier byte and trit position a weight sits in. The 24 five-trit bytes are walked in two
 // runs -- 16 then 8 -- each emitting its trits position-major, then the two four-trit bytes. This
@@ -707,11 +721,15 @@ constexpr int kRqBlock = 1024;
 constexpr int kRqThreads = 256;
 
 // The rotation and quant of one 1024-span, from the four values thread t holds (elements 4t..4t+3
-// of the span, already rounded to bf16 as the producer stored them). Every entry point below
-// reads its span its own way and hands the same four floats here, so y and the slot are the same
-// bits whichever produced them.
-__device__ __forceinline__ void ptq1_rotate_quant_span(const float x4[4], float* sh,
-                                                       const signed char* __restrict__ sign,
+// of the span, already rounded to bf16 as the producer stored them) and their four signs. Every
+// entry point below reads its span its own way and hands the same four floats here, so y and the
+// slot are the same bits whichever produced them. The signs are the checkpoint's: each entry
+// point fetches them (span_sign) before its wait.
+__device__ __forceinline__ char4 span_sign(const signed char* __restrict__ sign) {
+    const unsigned w = dp_ld_pre_wait(sign + blockIdx.x * kRqBlock + 4 * threadIdx.x);
+    return *reinterpret_cast<const char4*>(&w);
+}
+__device__ __forceinline__ void ptq1_rotate_quant_span(const float x4[4], float* sh, char4 sg,
                                                        __nv_bfloat16* __restrict__ y, float norm,
                                                        int k, int slot) {
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
@@ -719,7 +737,6 @@ __device__ __forceinline__ void ptq1_rotate_quant_span(const float x4[4], float*
     const size_t base = (size_t)blockIdx.y * k + span;
     float v[4];
     {
-        const char4 sg = *reinterpret_cast<const char4*>(sign + span + 4 * t);
         v[0] = x4[0] * (float)sg.x;
         v[1] = x4[1] * (float)sg.y;
         v[2] = x4[2] * (float)sg.z;
@@ -746,21 +763,27 @@ __device__ __forceinline__ void ptq1_rotate_quant_span(const float x4[4], float*
     }
     *reinterpret_cast<float4*>(sh + 4 * t) = make_float4(v[0], v[1], v[2], v[3]);
     __syncthreads();
-    // Stages 7-9: across warps, exactly as hadamard_span_kernel does them.
-    for (int len = 128; len < kRqBlock; len <<= 1) {
-        for (int i = t; i < kRqBlock / 2; i += kRqThreads) {
-            const int lo = ((i / len) * 2 * len) + (i % len);
-            const int hi = lo + len;
-            const float a = sh[lo], b = sh[hi];
-            sh[lo] = a + b;
-            sh[hi] = a - b;
+    // Stages 7-9: across warps, the pairs and the order of hadamard_span_kernel's, one column of
+    // eight a thread in registers (element i + 128 w, stage s pairing w with w ^ 2^s).
+    if (t < kRqBlock / 8) {
+        float c[8];
+#pragma unroll
+        for (int w = 0; w < 8; ++w) c[w] = sh[t + 128 * w];
+#pragma unroll
+        for (int len = 1; len < 8; len <<= 1)
+#pragma unroll
+            for (int w = 0; w < 8; ++w)
+                if (!(w & len)) {
+                    const float a = c[w], b = c[w + len];
+                    c[w] = a + b;
+                    c[w + len] = a - b;
+                }
+#pragma unroll
+        for (int w = 0; w < 8; ++w) {
+            const __nv_bfloat16 o = __float2bfloat16(c[w] * norm);
+            y[base + t + 128 * w] = o;
+            sh[t + 128 * w] = __bfloat162float(o);
         }
-        __syncthreads();
-    }
-    for (int i = t; i < kRqBlock; i += kRqThreads) {
-        const __nv_bfloat16 o = __float2bfloat16(sh[i] * norm);
-        y[base + i] = o;
-        sh[i] = __bfloat162float(o);
     }
     __syncthreads();
     // Quant: warp w takes 128-block w of the span; lane holds permuted positions 4*lane..+3.
@@ -788,35 +811,39 @@ __device__ __forceinline__ void ptq1_rotate_quant_span(const float x4[4], float*
     }
 }
 
-__device__ __forceinline__ void ld4_bf16_f(const __nv_bfloat16* p, float v[4]) {
-    const uint2 raw = *reinterpret_cast<const uint2*>(p);
+__device__ __forceinline__ void bf16x4_f(uint2 raw, float v[4]) {
     const __nv_bfloat162 lo = *reinterpret_cast<const __nv_bfloat162*>(&raw.x);
     const __nv_bfloat162 hi = *reinterpret_cast<const __nv_bfloat162*>(&raw.y);
     v[0] = __low2float(lo); v[1] = __high2float(lo);
     v[2] = __low2float(hi); v[3] = __high2float(hi);
 }
+__device__ __forceinline__ void ld4_bf16_f(const __nv_bfloat16* p, float v[4]) {
+    bf16x4_f(*reinterpret_cast<const uint2*>(p), v);
+}
 
 // blockIdx.y is the batch row: its own k-wide span of x and y and its own run of blocks in the
 // slot, laid out as ptq1_dp_quant_kernel lays out row j. The sign vector is shared.
 __global__ void __launch_bounds__(kRqThreads)
-ptq1_rotate_quant_kernel(const __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ y,
+ptq1_rotate_quant_kernel(const __nv_bfloat16* x, __nv_bfloat16* __restrict__ y,
                          const signed char* __restrict__ sign, float norm, int k, int slot) {
     // The dp4a GEMV after this may start its table and weight fetches (see dp_rq_launch).
     dp_pdl_trigger();
+    const char4 sg = span_sign(sign);
     dp_pdl_wait();
     __shared__ float sh[kRqBlock];
     float v[4];
     ld4_bf16_f(x + (size_t)blockIdx.y * k + blockIdx.x * kRqBlock + 4 * threadIdx.x, v);
-    ptq1_rotate_quant_span(v, sh, sign, y, norm, k, slot);
+    ptq1_rotate_quant_span(v, sh, sg, y, norm, k, slot);
 }
 
 // launch_prefill_swiglu's value, bf16(g / (1 + exp(-g)) * u) -- the same expression in the same
 // fast-math translation-unit flags -- rotated and quantized without the round trip through h.
 __global__ void __launch_bounds__(kRqThreads)
-ptq1_swiglu_rotate_quant_kernel(const __nv_bfloat16* __restrict__ gate,
-                                const __nv_bfloat16* __restrict__ up, __nv_bfloat16* __restrict__ y,
+ptq1_swiglu_rotate_quant_kernel(const __nv_bfloat16* gate,
+                                const __nv_bfloat16* up, __nv_bfloat16* __restrict__ y,
                                 const signed char* __restrict__ sign, float norm, int k, int slot) {
     dp_pdl_trigger();
+    const char4 sg = span_sign(sign);
     dp_pdl_wait();
     __shared__ float sh[kRqBlock];
     const size_t off = (size_t)blockIdx.y * k + blockIdx.x * kRqBlock + 4 * threadIdx.x;
@@ -826,7 +853,7 @@ ptq1_swiglu_rotate_quant_kernel(const __nv_bfloat16* __restrict__ gate,
 #pragma unroll
     for (int i = 0; i < 4; ++i)
         v[i] = __bfloat162float(__float2bfloat16(g[i] / (1.f + __expf(-g[i])) * u[i]));
-    ptq1_rotate_quant_span(v, sh, sign, y, norm, k, slot);
+    ptq1_rotate_quant_span(v, sh, sg, y, norm, k, slot);
 }
 
 // launch_add_rmsnorm2_q8 (one row) and then launch_ptq1_rotate_quant of its normed output, in one
@@ -847,8 +874,8 @@ __device__ __forceinline__ void dp_unpack8(const uint4& p, float out[8]) {
     for (int j = 0; j < 8; j++) out[j] = __bfloat162float(h[j]);
 }
 __global__ void __launch_bounds__(kRqThreads)
-ptq1_add_norm_rotate_quant_kernel(const __nv_bfloat16* __restrict__ x,
-                                  const __nv_bfloat16* __restrict__ residual,
+ptq1_add_norm_rotate_quant_kernel(const __nv_bfloat16* x,
+                                  const __nv_bfloat16* residual,
                                   const __nv_bfloat16* __restrict__ weight,
                                   __nv_bfloat16* __restrict__ out_sum,
                                   __nv_bfloat16* __restrict__ out_norm,
@@ -857,27 +884,30 @@ ptq1_add_norm_rotate_quant_kernel(const __nv_bfloat16* __restrict__ x,
                                   const signed char* __restrict__ sign,
                                   float norm, int k, int slot) {
     dp_pdl_trigger();
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int e0 = blockIdx.x * kRqBlock + 4 * t;
+    // The norm weight and the signs are the checkpoint's, fetched before the wait.
+    float wv[4];
+    bf16x4_f(dp_ld2_pre_wait(weight + e0), wv);
+    const char4 sg = span_sign(sign);
     dp_pdl_wait();
     __shared__ float sh[kRqBlock];
     __shared__ float s_warp[32];
-    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
     const int nvw = k / 256;   // add_rmsnorm2_q8's warps: k/8 threads
     constexpr int kVw = 8192 / 256 / (kRqThreads / 32);   // virtual warps per real warp, at most
     const uint4* x8 = reinterpret_cast<const uint4*>(x);
     const uint4* r8 = reinterpret_cast<const uint4*>(residual);
-    // Every global read this CTA makes is issued before any of them is waited on: the square sum's
-    // packs, and this thread's own four values of x, the residual and the norm weight.
+    // Every global read this CTA makes after the wait is issued before any of them is waited on:
+    // the square sum's packs, and this thread's own four values of x and the residual.
     uint4 xp[kVw], rp[kVw];
 #pragma unroll
     for (int i = 0; i < kVw; ++i) {
         const int vw = warp + i * (kRqThreads / 32);
-        if (vw < nvw) { xp[i] = __ldg(x8 + vw * 32 + lane); rp[i] = __ldg(r8 + vw * 32 + lane); }
+        if (vw < nvw) { xp[i] = x8[vw * 32 + lane]; rp[i] = r8[vw * 32 + lane]; }
     }
-    const int e0 = blockIdx.x * kRqBlock + 4 * t;
-    float xv[4], rv[4], wv[4], bv[4], sv[4];
+    float xv[4], rv[4], bv[4], sv[4];
     ld4_bf16_f(x + e0, xv);
     ld4_bf16_f(residual + e0, rv);
-    ld4_bf16_f(weight + e0, wv);
 #pragma unroll
     for (int i = 0; i < kVw; ++i) {
         const int vw = warp + i * (kRqThreads / 32);
@@ -940,7 +970,7 @@ ptq1_add_norm_rotate_quant_kernel(const __nv_bfloat16* __restrict__ x,
         s += __shfl_xor_sync(0xffffffffu, s, 4);
         if ((t & 7) == 0) blk->ds = __floats2half2_rn(d, d * (float)s);
     }
-    ptq1_rotate_quant_span(bv, sh, sign, y, norm, k, slot);
+    ptq1_rotate_quant_span(bv, sh, sg, y, norm, k, slot);
 }
 
 // SPARKINFER_PTQ1_FUSE=0 keeps the norm and the SwiGLU as launches of their own, for an A/B.
