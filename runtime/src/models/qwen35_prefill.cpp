@@ -5894,6 +5894,20 @@ static void gemv_fp8_rows_any(const bf16* in, const void* w, bf16* out, int rows
         kernels::launch_gemv_fp8(in + (size_t)r * k, w, out + (size_t)r * no, no, k, st);
 }
 
+// Packed decode steps chained on the device (Qwen35PrefillCtx::pipe_mode). One thread drives
+// packed decode, and the verify graphs and their pinned slots are per thread too.
+static thread_local int* t_pipe_ph_out = nullptr;           // the pass's pinned token slots
+static thread_local int* t_pipe_fb = nullptr;               // a chained step's predecessor's tokens
+static thread_local cudaEvent_t t_pipe_ev = nullptr;
+static thread_local const int* t_pipe_out_ids = nullptr;    // the in-flight step's device buffers
+static thread_local const int* t_pipe_pos = nullptr;
+static thread_local int t_pipe_n = 0;
+
+void dflash_packed_drain(cudaStream_t st, int n, int* out) {
+    pf_cu(cudaStreamSynchronize(st), "packed drain sync");
+    if (t_pipe_ph_out) std::memcpy(out, t_pipe_ph_out, (size_t)n * sizeof(int));
+}
+
 int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int n, int start_pos,
                             const int* capture_layers, int n_capture, void* capture_dst,
                             int* out_argmax, bool capture_only) {
@@ -6505,6 +6519,14 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
             verify_head_scale = nullptr;
         }
     }
+    // A chained step's inputs are not the host's to write: the step still in flight may not have
+    // uploaded its own yet, and the feedback kernel writes this step's after that step ends.
+    if (!t_pipe_fb) {
+        pf_cu(cudaHostAlloc(&t_pipe_fb, kVerifyMaxRows * sizeof(int), cudaHostAllocDefault), "pipe host tokens");
+        pf_cu(cudaEventCreateWithFlags(&t_pipe_ev, cudaEventDisableTiming), "pipe event");
+    }
+    t_pipe_ph_out = ph_out;
+    if (s.pipe_mode != 2)
     for (int i = 0; i < N; ++i) {
         ph_ids[i] = token_ids[i];
         // Packed rows each sit at their OWN sequence's next position; verify rows are consecutive.
@@ -6853,11 +6875,28 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     const void* conv_key    = packed ? (const void*)s.packed_lin_conv  : (const void*)s.lin_conv_state;
     const void* btable_key  = packed ? (const void*)s.packed_rows      : (const void*)btable;
     const uint64_t seq_key  = packed ? UINT64_MAX - 1 : s.seq_id;
-    if (!s.verify_eager && (graph_model_key != s.w.lm_head || graph_state_key != state_key ||
+    const bool graph_keys_moved =
+        graph_model_key != s.w.lm_head || graph_state_key != state_key ||
         graph_conv_key != conv_key || graph_capture_key != capture_dst ||
         graph_btable_key != btable_key || graph_seq_key != seq_key || graph_ns_key != ns ||
         graph_shadow_key != (const void*)s.bonsai_dec_layers ||
-        graph_head4_key != (const void*)s.w.lm_head_fp4)) {
+        graph_head4_key != (const void*)s.w.lm_head_fp4;
+    // A chained step replays this width's graph on the in-flight step's own buffers, or not at
+    // all: nothing has been enqueued yet, and the caller drains and runs the step as before.
+    if (s.pipe_mode == 2 && (!packed || s.verify_eager || graph_keys_moved || !graph_ready_t[N] ||
+                             capture_only || t_pipe_out_ids != out_ids || t_pipe_pos != pos ||
+                             t_pipe_n != N))
+        return -2;
+    if (s.pipe_mode == 2) {
+        kernels::launch_packed_decode_feedback(ph_ids, ph_pos, ph_seq, t_pipe_fb, out_ids, pos, N, st);
+        pf_cu(cudaEventRecord(t_pipe_ev, st), "pipe event record");
+        pf_cu(cudaGraphLaunch(verify_exec[N], st), "verify graph launch (chained)");
+        pf_cu(cudaEventSynchronize(t_pipe_ev), "pipe event sync");
+        std::memcpy(out_argmax, t_pipe_fb, (size_t)N * sizeof(int));
+        if (s.pipe_inflight) *s.pipe_inflight = true;
+        return N;   // t_pipe_* already name this width's buffers
+    }
+    if (!s.verify_eager && graph_keys_moved) {
         for (int t = 1; t <= kVerifyMaxRows; t++) {
             if (verify_exec[t]) cudaGraphExecDestroy(verify_exec[t]);
             if (verify_graph[t]) cudaGraphDestroy(verify_graph[t]);
@@ -6878,6 +6917,14 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     if (!s.verify_eager && graph_ready_t[N] && capture_only) return 0;   // this tier is already built
     if (!s.verify_eager && graph_ready_t[N]) {
         pf_cu(cudaGraphLaunch(verify_exec[N], st), "verify graph launch");
+        if (s.pipe_mode == 1 && packed && !vdbg_dump_now) {
+            // Left in flight: a chained step (pipe_mode 2) or dflash_packed_drain collects it.
+            t_pipe_out_ids = out_ids;
+            t_pipe_pos = pos;
+            t_pipe_n = N;
+            if (s.pipe_inflight) *s.pipe_inflight = true;
+            return N;
+        }
         pf_cu(cudaStreamSynchronize(st), "verify graph sync");
         std::memcpy(out_argmax, ph_out, (size_t)N * sizeof(int));
         if (vdbg_dump_now) {

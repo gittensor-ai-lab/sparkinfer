@@ -139,6 +139,15 @@ struct Qwen35PrefillCtx {
     // run: the buffer is carved from the verify arena, whose layout is fixed across passes, so it
     // holds this pass's logits until the next verify pass.
     float**              packed_logits_out = nullptr;
+    // Packed decode steps chained on the device (Qwen35Model::decode_packed_async / _chain).
+    // pipe_mode 1: launch the step and return without waiting for it (*pipe_inflight set when it
+    // did; a pass that had to capture its graph first runs as before). pipe_mode 2: feed the
+    // in-flight step's tokens, and its positions + 1, into this step's inputs on the device,
+    // launch this step's graph, then wait for the in-flight step alone and return ITS tokens in
+    // out_argmax. Mode 2 returns -2 having enqueued nothing when it cannot chain (no graph for
+    // this width, a graph key moved, the arena moved).
+    int                  pipe_mode = 0;
+    bool*                pipe_inflight = nullptr;
     // dflash_verify_short_run as a PREFILL of n known tokens (Qwen35Model::ingest_tail_rows):
     // verify_eager runs it without the verify graph cache -- no flush, no replay, no recording --
     // so a call for a session other than the cached one leaves packed decode's graphs alone;
@@ -297,6 +306,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
 int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int n, int start_pos,
                             const int* capture_layers, int n_capture, void* capture_dst,
                             int* out_argmax, bool capture_only = false);
+// Waits for the packed step left in flight by pipe_mode 1 or 2 and writes its n tokens to out.
+void dflash_packed_drain(cudaStream_t st, int n, int* out);
 
 // Release request-scoped verify graphs and their device arena. Call after a speculative
 // generation so the next long prefill sees the same free-VRAM budget as the first one.

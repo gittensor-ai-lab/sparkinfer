@@ -297,8 +297,29 @@ private:
     // (Qwen35Model::mixed_step_multi), each chunk's `done` set to what it ingested; a chunk that
     // finished its prompt leaves its job in DECODE with the first token pending, as a packed
     // prefill does.
+    //
+    // `may_pipe`: nothing else runs on the device this iteration (no prefill, no mixed chunks), so
+    // an all-greedy step may be left in flight and the next one chained on the device
+    // (SPARKINFER_CB_OVERLAP, see pipe_).
     bool step_jobs_packed(const std::vector<uint64_t>& ids, bool& any_finished,
-                          std::vector<MixChunk>* chunks = nullptr);
+                          std::vector<MixChunk>* chunks = nullptr, bool may_pipe = false);
+    // The packed step left in flight (worker thread only): its rows in batch order, their tokens
+    // still on the device. Each row's next_token is stale until drain_packed_pipe() or a chained
+    // step (step_jobs_packed) fills it in.
+    struct PackedPipe {
+        bool on = false;
+        std::vector<Job*> rows;
+        std::vector<uint64_t> ids;    // request ids
+        std::vector<uint64_t> seqs;   // session ids, batch order
+    };
+    PackedPipe pipe_;
+    // Waits for the step in flight and hands each row its token.
+    void drain_packed_pipe();
+    // The next step of the chain when the scheduled rows are the in-flight step's and none of them
+    // reaches its token limit on the token in flight; false having done nothing otherwise.
+    bool step_packed_chained(const std::vector<uint64_t>& ids, bool& any_finished);
+    bool emit_packed_token(Job& j, const Qwen35Config& cfg, bool& any_finished,
+                           const std::function<void()>* before_finish);
     // The prompts a mixed step would carry this iteration (empty when nothing is eligible or
     // mixing is off, SPARKINFER_MIXED_CHUNK), and the scheduled prefills it can never carry, which
     // step_job runs as before.

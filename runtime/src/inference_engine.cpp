@@ -1425,6 +1425,8 @@ int packed_decode_width_cb() {
 
 void ContinuousBatchEngine::worker_loop() {
     while (true) {
+        // Speculation drives the device itself: no packed step may still be running under it.
+        if (speculative_) drain_packed_pipe();
         // A request that is alone and eligible decodes speculatively (see enable_speculative). It
         // is picked up before its prefill starts, because speculation prefills with hidden-state
         // capture on.
@@ -1647,7 +1649,8 @@ void ContinuousBatchEngine::worker_loop() {
         std::vector<MixChunk> mix;
         std::vector<uint64_t> unmixable;
         if (mix_decode) pick_mixed_chunks(prefill_ids, (int)decode_ids.size(), mix, unmixable);
-        if (!step_jobs_packed(decode_ids, any_finished, mix.empty() ? nullptr : &mix)) {
+        if (!step_jobs_packed(decode_ids, any_finished, mix.empty() ? nullptr : &mix,
+                              /*may_pipe=*/prefill_ids.empty() && mix.empty())) {
             for (uint64_t id : decode_ids) {
                 Job* job = nullptr;
                 {
@@ -2011,11 +2014,118 @@ bool ContinuousBatchEngine::run_mixed_chunks(const std::vector<int>& toks, const
     return true;
 }
 
+// Emit j's pending token and run the same termination checks step_job() does; true when j decodes
+// on. `before_finish` (optional) runs before a row is retired.
+bool ContinuousBatchEngine::emit_packed_token(Job& J, const Qwen35Config& cfg, bool& any_finished,
+                                              const std::function<void()>* before_finish) {
+    Job* j = &J;
+    const auto t_emit = std::chrono::steady_clock::now();
+    if (!j->saw_first_tok) {
+        j->t_first = t_emit;
+        j->saw_first_tok = true;
+        j->ttft_ms = std::chrono::duration<double, std::milli>(j->t_first - j->t_submit).count();
+    }
+    j->output.push_back(j->next_token);
+    j->decode_emitted++;
+    if (j->on_token && !j->on_token(j->next_token)) {
+        j->cancelled = true;
+        j->generation_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - j->t_submit).count();
+        if (before_finish) (*before_finish)();
+        finish_job_impl(*j);
+        any_finished = true;
+        return false;
+    }
+    const bool hit_eos = !j->req.ignore_eos &&
+                         (j->next_token == cfg.eos_id ||
+                          (cfg.eos_id2 >= 0 && j->next_token == cfg.eos_id2));
+    const bool hit_limit = j->decode_emitted >= j->req.max_new_tokens;
+    if (hit_eos || hit_limit) {
+        j->reached_token_limit = hit_limit && !hit_eos;
+        const auto t_end = std::chrono::steady_clock::now();
+        j->generation_ms = std::chrono::duration<double, std::milli>(t_end - j->t_submit).count();
+        if (j->saw_first_tok && j->generation_ms > j->ttft_ms && j->decode_emitted > 0) {
+            const double decode_ms = std::max(j->generation_ms - j->ttft_ms, 1.0);
+            j->decode_tps = (double)j->decode_emitted * 1000.0 / decode_ms;
+        }
+        if (before_finish) (*before_finish)();
+        finish_job_impl(*j);
+        any_finished = true;
+        return false;
+    }
+    return true;
+}
+
+// CHAINED PACKED DECODE (SPARKINFER_CB_OVERLAP=0 turns it off). Between two packed steps the GPU
+// used to wait for the host: the step's sync, then emitting its tokens, the scheduler, and the
+// next step's graph launch (~550 us a step on Bonsai cb c32, nsys; ~275 us of it the launch of a
+// ~900-node graph). An all-greedy step whose rows are exactly the next step's is instead left in
+// flight (pipe_); the next iteration launches the following step at once -- its token ids and
+// positions written on the device from the step in flight (launch_packed_decode_feedback) --
+// and only then waits for the step in flight and emits its tokens, so all of that host work runs
+// under the GPU's next step. Same graph, same inputs: the tokens are the ones the unchained loop
+// computes.
+//
+// The chain breaks -- the step in flight is waited for and the loop goes on as before -- whenever
+// the next step's rows could differ: a prefill or mixed chunk to run, another row set, a row whose
+// in-flight token is its last (max_new_tokens), a sampled row, a batch wider than one packed
+// step, or speculation on. A row that ends on a token nobody could foresee (EOS, its request
+// stopping) has already been launched into the next step: that step is waited for before the row
+// is retired, the row's token from it is dropped, and the other rows keep theirs.
+void ContinuousBatchEngine::drain_packed_pipe() {
+    if (!pipe_.on) return;
+    std::vector<int> out(pipe_.rows.size(), -1);
+    model_->decode_packed_drain((int)out.size(), out.data());
+    for (size_t i = 0; i < out.size(); i++) pipe_.rows[i]->next_token = out[i];
+    pipe_.on = false;
+}
+
+bool ContinuousBatchEngine::step_packed_chained(const std::vector<uint64_t>& ids, bool& any_finished) {
+    const size_t n = pipe_.rows.size();
+    if (ids.size() != n) return false;
+    for (uint64_t id : ids)
+        if (std::find(pipe_.ids.begin(), pipe_.ids.end(), id) == pipe_.ids.end()) return false;
+    std::vector<int> pos(n), out(n, -1);
+    for (size_t i = 0; i < n; i++) {
+        const Job* j = pipe_.rows[i];
+        // The in-flight token is emitted below; a row it takes to its limit leaves the batch.
+        if (j->done || j->decode_emitted + 1 >= j->req.max_new_tokens) return false;
+        pos[i] = (int)j->req.prompt.size() + j->decode_emitted;   // the next step's position
+    }
+    if (!model_->decode_packed_chain(pos.data(), pipe_.seqs.data(), (int)n, out.data())) return false;
+    const Qwen35Config& cfg = model_->config();
+    const std::vector<Job*> rows = pipe_.rows;
+    std::vector<int> next;   // the new step's tokens, once a row's end made us wait for it
+    const std::function<void()> wait_step = [&] {
+        if (!pipe_.on) return;
+        next.assign(n, -1);
+        model_->decode_packed_drain((int)n, next.data());
+        pipe_.on = false;
+    };
+    std::vector<char> stays(n, 0);
+    for (size_t i = 0; i < n; i++) {
+        rows[i]->next_token = out[i];
+        stays[i] = emit_packed_token(*rows[i], cfg, any_finished, &wait_step) ? 1 : 0;
+    }
+    if (!pipe_.on)
+        for (size_t i = 0; i < n; i++)
+            if (stays[i]) rows[i]->next_token = next[i];
+    return true;
+}
+
 bool ContinuousBatchEngine::step_jobs_packed(const std::vector<uint64_t>& ids, bool& any_finished,
-                                             std::vector<MixChunk>* chunks) {
+                                             std::vector<MixChunk>* chunks, bool may_pipe) {
     if (chunks)
         for (MixChunk& c : *chunks) c.done = 0;
     if (chunks && chunks->empty()) chunks = nullptr;
+    static const bool overlap = [] {
+        const char* e = getenv("SPARKINFER_CB_OVERLAP");
+        return !(e && e[0] == '0');
+    }();
+    if (pipe_.on) {
+        if (overlap && may_pipe && !chunks && step_packed_chained(ids, any_finished)) return true;
+        drain_packed_pipe();
+    }
     static const bool enabled = [] {
         const char* e = getenv("SPARKINFER_PACKED_DECODE");
         return !(e && e[0] == '0');
@@ -2082,41 +2192,14 @@ bool ContinuousBatchEngine::step_jobs_packed(const std::vector<uint64_t>& ids, b
     // that finishes here simply drops out of the packed forward below.
     std::vector<Job*> live;
     live.reserve(jobs.size());
-    for (Job* j : jobs) {
+    std::vector<uint64_t> live_ids;
+    live_ids.reserve(jobs.size());
+    for (size_t k = 0; k < jobs.size(); k++) {
+        Job* j = jobs[k];
         if (j == hold) continue;
-        const auto t_emit = std::chrono::steady_clock::now();
-        if (!j->saw_first_tok) {
-            j->t_first = t_emit;
-            j->saw_first_tok = true;
-            j->ttft_ms = std::chrono::duration<double, std::milli>(j->t_first - j->t_submit).count();
-        }
-        j->output.push_back(j->next_token);
-        j->decode_emitted++;
-        if (j->on_token && !j->on_token(j->next_token)) {
-            j->cancelled = true;
-            j->generation_ms = std::chrono::duration<double, std::milli>(
-                std::chrono::steady_clock::now() - j->t_submit).count();
-            finish_job_impl(*j);
-            any_finished = true;
-            continue;
-        }
-        const bool hit_eos = !j->req.ignore_eos &&
-                             (j->next_token == cfg.eos_id ||
-                              (cfg.eos_id2 >= 0 && j->next_token == cfg.eos_id2));
-        const bool hit_limit = j->decode_emitted >= j->req.max_new_tokens;
-        if (hit_eos || hit_limit) {
-            j->reached_token_limit = hit_limit && !hit_eos;
-            const auto t_end = std::chrono::steady_clock::now();
-            j->generation_ms = std::chrono::duration<double, std::milli>(t_end - j->t_submit).count();
-            if (j->saw_first_tok && j->generation_ms > j->ttft_ms && j->decode_emitted > 0) {
-                const double decode_ms = std::max(j->generation_ms - j->ttft_ms, 1.0);
-                j->decode_tps = (double)j->decode_emitted * 1000.0 / decode_ms;
-            }
-            finish_job_impl(*j);
-            any_finished = true;
-            continue;
-        }
+        if (!emit_packed_token(*j, cfg, any_finished, nullptr)) continue;
         live.push_back(j);
+        live_ids.push_back(ids[k]);
     }
     if (live.empty()) return true;
 
@@ -2158,6 +2241,21 @@ bool ContinuousBatchEngine::step_jobs_packed(const std::vector<uint64_t>& ids, b
         // The first group carries the prompt chunks.
         if (off == 0 && chunks) ok = run_mixed_chunks(toks, pos, seqs, out, any_sampled ? &samp : nullptr,
                                                       *chunks);
+        // The whole batch in one greedy step, nothing else to run this iteration: leave it in
+        // flight for the next iteration to chain (see drain_packed_pipe).
+        if (!ok && overlap && may_pipe && !chunks && !hold && !any_sampled && m >= 2 &&
+            m == live.size()) {
+            const int r = model_->decode_packed_async(toks.data(), pos.data(), seqs.data(), (int)m,
+                                                      out.data());
+            if (r == 1) {
+                pipe_.on = true;
+                pipe_.rows = live;
+                pipe_.ids = live_ids;
+                pipe_.seqs = seqs;
+                return true;
+            }
+            ok = r == 0;
+        }
         if (!ok && m >= 2)
             ok = model_->decode_packed(toks.data(), pos.data(), seqs.data(), (int)m, out.data(),
                                        any_sampled ? &samp : nullptr);

@@ -666,6 +666,19 @@ public:
     // Every sequence must have an open session and live KV. n is capped by the packed graph tiers.
     bool decode_packed(const int* tokens, const int* positions, const uint64_t* seq_ids, int n,
                        int* out_sampled, const PackedSampling* sampling = nullptr);
+    // CHAINED PACKED DECODE (the continuous batch engine's SPARKINFER_CB_OVERLAP). All-greedy rows
+    // only. decode_packed_async is decode_packed that may leave the step in flight: 1 = in flight
+    // (its tokens come from decode_packed_chain or decode_packed_drain), 0 = it ran to the end
+    // (out_sampled filled), -1 = declined having changed nothing.
+    int decode_packed_async(const int* tokens, const int* positions, const uint64_t* seq_ids, int n,
+                            int* out_sampled);
+    // With a step in flight for exactly these rows in this order: launch the next step, its tokens
+    // and positions fed on the device from the in-flight one (`positions` are the new step's, for
+    // the host-side dispatch), then wait for the in-flight step alone and write its tokens to
+    // out_prev. The new step is left in flight. False = nothing launched (the caller drains).
+    bool decode_packed_chain(const int* positions, const uint64_t* seq_ids, int n, int* out_prev);
+    // Waits for the step in flight and writes its n tokens to out.
+    void decode_packed_drain(int n, int* out);
     // MIXED STEP: ONE forward that decodes n_dec packed rows (what decode_packed does for them) and
     // prefills the next `len` tokens of chunk_seq's prompt at positions pos0.. (what a prefill
     // pass or resume does for them), every row-wise weight read shared (Qwen35PrefillCtx::mix_n).

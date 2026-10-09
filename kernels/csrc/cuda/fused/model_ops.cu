@@ -157,6 +157,22 @@ __global__ void decode_feedback_kernel(int* __restrict__ scalars,
     scalars[3] += 1;
 }
 
+// Chained packed decode steps (launch_packed_decode_feedback): the next step's inputs, written
+// into the pinned host slots its graph uploads, and the step's tokens once more for the host.
+__global__ void packed_decode_feedback_kernel(int* h_ids, int* h_pos, int* h_seq, int* h_tok,
+                                              const int* __restrict__ out_id,
+                                              const int* __restrict__ pos, int n) {
+    const int i = threadIdx.x;
+    if (i < n) {
+        const int t = out_id[i], p = pos[i] + 1;
+        h_ids[i] = t;
+        h_pos[i] = p;
+        h_seq[i] = p + 1;
+        h_tok[i] = t;
+    }
+    __threadfence_system();
+}
+
 // Gemma2-style final-logit softcap, in place: logits[v] = tanh(logits[v] * scale / cap) * cap.
 // One block per row, grid-stride over vocab.
 // One CTA per row left a 202k-element vocab to a single 256-thread block at decode (n_rows == 1),
@@ -260,6 +276,13 @@ void launch_argmax(const float* logits, int* out_id, int n_rows, int vocab, cuda
 
 void launch_decode_feedback(int* scalars, const int* out_id, cudaStream_t stream) {
     decode_feedback_kernel<<<1, 1, 0, stream>>>(scalars, out_id);
+}
+
+void launch_packed_decode_feedback(int* h_ids, int* h_pos, int* h_seq, int* h_tok,
+                                   const int* out_id, const int* pos, int n, cudaStream_t stream) {
+    if (n < 1 || n > 1024) return;
+    packed_decode_feedback_kernel<<<1, (n + 31) & ~31, 0, stream>>>(h_ids, h_pos, h_seq, h_tok,
+                                                                    out_id, pos, n);
 }
 
 void launch_logit_softcap(float* logits, int n_rows, int vocab, float scale, float cap,

@@ -373,6 +373,13 @@ void launch_vocab_iota_init(int* vocab_iota, int vocab, cudaStream_t stream = nu
 // Benchmark-only decode feedback: tok = out_id; pos/writepos/seqlen += 1.
 // Capturable, so a decode CUDA graph can self-feed during throughput timing.
 void launch_decode_feedback(int* scalars, const int* out_id, cudaStream_t stream = nullptr);
+// Chained packed decode (SPARKINFER_CB_OVERLAP): from the step that just ran, the next step's
+// inputs into the pinned host slots its graph uploads -- h_ids[i] = out_id[i], h_pos[i] = pos[i]
+// + 1, h_seq[i] = pos[i] + 2 -- and the tokens again into h_tok for the host. The h_* arrays are
+// cudaHostAlloc'd (mapped under unified addressing); out_id and pos are device arrays of n.
+void launch_packed_decode_feedback(int* h_ids, int* h_pos, int* h_seq, int* h_tok,
+                                   const int* out_id, const int* pos, int n,
+                                   cudaStream_t stream = nullptr);
 // Qwen3.5/Qwen3.6 hybrid Gated DeltaNet helpers.
 void launch_qwen36_split_q_gate(const void* qg_bf16, void* q_bf16, void* gate_bf16,
                                 int n_heads, int head_dim, cudaStream_t stream = nullptr);

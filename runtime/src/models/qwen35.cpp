@@ -5499,26 +5499,10 @@ static bool packed_rows_prepare(Impl& s, const uint64_t* seq_ids, int n, bool* s
     return true;
 }
 
-bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
-                                const uint64_t* seq_ids, int n, int* out_sampled,
-                                const PackedSampling* sampling) {
-    Impl& s = *p_;
-    if (!tokens || !positions || !seq_ids || !out_sampled) return false;
-    if (n < 1 || n > kQwen35MaxPackedRows) return false;
-    if (!s.cfg.hybrid || !s.gguf) return false;
-    std::lock_guard<std::recursive_mutex> device_lock(s.device_mu);
-
-    // Only a temperature above 0 can move a row off the argmax: top_k/top_p always keep rank 0,
-    // so a truncating row at temperature 0 is still its argmax (forward_token behaves the same).
-    bool any_sampled = false;
-    if (sampling) {
-        if (!sampling->temperature || !sampling->seed || !sampling->step || !sampling->top_k ||
-            !sampling->top_p) return false;
-        for (int i = 0; i < n && !any_sampled; i++) any_sampled = sampling->temperature[i] > 0.f;
-    }
-    if (any_sampled && !ensure_packed_samp(s)) return false;
-    bool packed_state_b16 = false;
-    if (!packed_rows_prepare(s, seq_ids, n, &packed_state_b16)) return false;
+// decode_packed's forward context for rows packed_rows_prepare has just resolved.
+template <class Impl>
+static Qwen35PrefillCtx packed_decode_ctx(Impl& s, const uint64_t* seq_ids, const int* positions,
+                                          bool packed_state_b16) {
     float** h_states = static_cast<float**>(s.packed_host_states);
     void**  h_convs  = static_cast<void**>(s.packed_host_convs);
 
@@ -5551,6 +5535,30 @@ bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
         if (so != s.bonsai_sign_dev.end()) ctx.bonsai_sign_out = so->second;
         if (s.bonsai_ffn_q) ctx.bonsai_dec_head = s.bonsai_dec_head;
     }
+    return ctx;
+}
+
+bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
+                                const uint64_t* seq_ids, int n, int* out_sampled,
+                                const PackedSampling* sampling) {
+    Impl& s = *p_;
+    if (!tokens || !positions || !seq_ids || !out_sampled) return false;
+    if (n < 1 || n > kQwen35MaxPackedRows) return false;
+    if (!s.cfg.hybrid || !s.gguf) return false;
+    std::lock_guard<std::recursive_mutex> device_lock(s.device_mu);
+
+    // Only a temperature above 0 can move a row off the argmax: top_k/top_p always keep rank 0,
+    // so a truncating row at temperature 0 is still its argmax (forward_token behaves the same).
+    bool any_sampled = false;
+    if (sampling) {
+        if (!sampling->temperature || !sampling->seed || !sampling->step || !sampling->top_k ||
+            !sampling->top_p) return false;
+        for (int i = 0; i < n && !any_sampled; i++) any_sampled = sampling->temperature[i] > 0.f;
+    }
+    if (any_sampled && !ensure_packed_samp(s)) return false;
+    bool packed_state_b16 = false;
+    if (!packed_rows_prepare(s, seq_ids, n, &packed_state_b16)) return false;
+    Qwen35PrefillCtx ctx = packed_decode_ctx(s, seq_ids, positions, packed_state_b16);
     float* packed_logits = nullptr;
     ctx.packed_logits_out = &packed_logits;
     const int consumed = dflash_verify_short_run(ctx, tokens, n, positions[0],
@@ -5573,6 +5581,61 @@ bool Qwen35Model::decode_packed(const int* tokens, const int* positions,
             if (h->temp[i] > 0.f) out_sampled[i] = h->out[i];
     }
     return true;
+}
+
+// Chained packed decode (see the declarations). The same forward as decode_packed's greedy step:
+// the same graph on the same inputs -- only where those inputs are written (the device, for a
+// chained step) and when the host waits for the result change.
+int Qwen35Model::decode_packed_async(const int* tokens, const int* positions,
+                                     const uint64_t* seq_ids, int n, int* out_sampled) {
+    Impl& s = *p_;
+    if (!tokens || !positions || !seq_ids || !out_sampled) return -1;
+    if (n < 2 || n > kQwen35MaxPackedRows) return -1;
+    if (!s.cfg.hybrid || !s.gguf) return -1;
+    std::lock_guard<std::recursive_mutex> device_lock(s.device_mu);
+    bool packed_state_b16 = false;
+    if (!packed_rows_prepare(s, seq_ids, n, &packed_state_b16)) return -1;
+    Qwen35PrefillCtx ctx = packed_decode_ctx(s, seq_ids, positions, packed_state_b16);
+    float* packed_logits = nullptr;
+    ctx.packed_logits_out = &packed_logits;
+    bool inflight = false;
+    ctx.pipe_mode = 1;
+    ctx.pipe_inflight = &inflight;
+    const int consumed = dflash_verify_short_run(ctx, tokens, n, positions[0],
+                                                 nullptr, 0, nullptr, out_sampled);
+    if (consumed != n) return -1;
+    return inflight ? 1 : 0;
+}
+
+bool Qwen35Model::decode_packed_chain(const int* positions, const uint64_t* seq_ids, int n,
+                                      int* out_prev) {
+    Impl& s = *p_;
+    if (!positions || !seq_ids || !out_prev || n < 2 || n > kQwen35MaxPackedRows) return false;
+    std::lock_guard<std::recursive_mutex> device_lock(s.device_mu);
+    // The in-flight step's rows, in its order: the per-row tables on the device are already
+    // theirs, and nothing may be uploaded under a step that may not have read its own yet.
+    const uint64_t* h_seqs = static_cast<const uint64_t*>(s.packed_host_seqs);
+    if (!h_seqs || s.packed_rows_valid != n) return false;
+    for (int i = 0; i < n; i++)
+        if (h_seqs[i] != seq_ids[i]) return false;
+    bool packed_state_b16 = false;
+    if (!packed_rows_prepare(s, seq_ids, n, &packed_state_b16)) return false;
+    Qwen35PrefillCtx ctx = packed_decode_ctx(s, seq_ids, positions, packed_state_b16);
+    float* packed_logits = nullptr;
+    ctx.packed_logits_out = &packed_logits;
+    bool inflight = false;
+    ctx.pipe_mode = 2;
+    ctx.pipe_inflight = &inflight;
+    // The token ids come from the device; `positions` only stands in for the host array.
+    const int consumed = dflash_verify_short_run(ctx, positions, n, positions[0],
+                                                 nullptr, 0, nullptr, out_prev);
+    return consumed == n && inflight;
+}
+
+void Qwen35Model::decode_packed_drain(int n, int* out) {
+    Impl& s = *p_;
+    std::lock_guard<std::recursive_mutex> device_lock(s.device_mu);
+    dflash_packed_drain(s.stream, n, out);
 }
 
 // A mixed step's scratch, allocated once: per-row tables and positions, split-KV partials, the
