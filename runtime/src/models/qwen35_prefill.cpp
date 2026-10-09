@@ -2226,6 +2226,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
     // written by the norm that wrote xn (norm_xn). Survives the layer top's memo reset, as
     // xn_fp8_ready does; cleared by every other writer of A_i8.
     bool xn_tfp4_ready = false;
+    // The same for the short prompt's FP4 legs (sfp4_act's operand, launch_ptq1_rotq_fp4's layout).
+    bool xn_sfp4_ready = false;
     auto apk = [&]() -> const signed char* { return a_pk ? A_i8p : nullptr; };
     // The copy to hand a quantize of R x K: none when it would not fit (a_i8p_sz above), nor, off
     // Muse, when R is past the rows the fused GEMM accepts -- nothing would read it.
@@ -2238,7 +2240,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         signed char* qp = apk_dst(R, K);
         a_pk = kernels::launch_prefill_quantize_rows_i8(A, A_i8, sx, R, K, st, qp) && qp;
         a_q = A; a_qR = R; a_qK = K;
-        xn_tfp4_ready = false;
+        xn_tfp4_ready = false; xn_sfp4_ready = false;
     };
     // int8 tensor-core GEMM with the Muse-only split-K fan-out tried first. Everything else keeps
     // calling the single-block launcher, so non-Muse output is byte-for-byte what it was.
@@ -2478,7 +2480,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             return false;
         a_pk = qp != nullptr;
         a_q = nullptr;   // A_i8 now holds the ROTATED activation: no memo may reuse it
-        xn_tfp4_ready = false;
+        xn_tfp4_ready = false; xn_sfp4_ready = false;
         return true;
     };
     // The same ternary legs where the fused GEMM takes the pass, on the FP4 tensor cores: the input
@@ -2491,14 +2493,36 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         return !(e && e[0] == '0');
     }();
     auto sfp4_act = [&](const bf16* A, const bf16* U, const void* sign, int R, int K) -> bool {
+        // xn's operand already in A_i8, written by the norm that wrote xn (norm_xn).
+        const bool pre = xn_sfp4_ready && A == xn && !U && sign == s.bonsai_sign_hidden &&
+                         R == N && K == H;
         if (!sfp4_env || !use_i8 || !A_i8 || !sign || !qb_dense_pass ||
             R > kernels::pf_dense_gemm_qi8_max_m() || s.bonsai_block != 1024 || (K % 1024) ||
             kernels::ptq1_fp4_act_bytes(R, K) > a_i8_sz ||
-            !kernels::launch_ptq1_rotq_fp4(A, U, static_cast<const signed char*>(sign), A_i8, R,
-                                           K, s.bonsai_block, st))
+            (!pre && !kernels::launch_ptq1_rotq_fp4(A, U, static_cast<const signed char*>(sign),
+                                                    A_i8, R, K, s.bonsai_block, st)))
             return false;
         a_q = nullptr; a_pk = false;   // A_i8 now holds FP4 operands: no int8 memo may reuse it
-        xn_tfp4_ready = false;
+        xn_tfp4_ready = false; xn_sfp4_ready = false;
+        return true;
+    };
+    // Whether sfp4_act(A, U, sign, R, K) takes a leg and sfp4_gemm then runs it, without launching
+    // anything: their own tests (sfp4_takes), with the leg's use_i8 given for a layer that sets
+    // its own (sfp4_fits).
+    auto sfp4_fits = [&](int R, int K, bool i8) -> bool {
+        return sfp4_env && i8 && A_i8 && qb_dense_pass &&
+               R <= kernels::pf_dense_gemm_qi8_max_m() && s.bonsai_block == 1024 &&
+               (K % 1024) == 0 && kernels::ptq1_fp4_act_bytes(R, K) <= a_i8_sz &&
+               kernels::ptq1_fp4_gemm_supported(R, K);
+    };
+    auto sfp4_takes = [&](int R, int K) -> bool { return sfp4_fits(R, K, use_i8); };
+    // sfp4_act where the kernel producing A is folded into the rotation: fold(A_i8) writes the
+    // operand sfp4_act would have from A's bf16 rows, which are then never written. Only where
+    // sfp4_takes holds.
+    auto sfp4_act_fold = [&](auto&& fold) -> bool {
+        if (!fold(static_cast<void*>(A_i8))) return false;
+        a_q = nullptr; a_pk = false;
+        xn_tfp4_ready = false; xn_sfp4_ready = false;
         return true;
     };
     auto sfp4_gemm = [&](int R, int K, const void* const* W, void* const* C, const int* n, int nl,
@@ -2542,7 +2566,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             return false;
         fp4_parts(A_i8, N8, K, &d, &r, &l, false);
         const bool pre = xn_tfp4_ready && A == xn && sign == s.bonsai_sign_hidden && K == H;
-        xn_tfp4_ready = false;
+        xn_tfp4_ready = false; xn_sfp4_ready = false;
         if (!pre && !kernels::launch_ptq1_rotq_rows_nvfp4(A, nullptr, static_cast<const signed char*>(sign),
                                                           d, nullptr, N8, K, s.bonsai_block, st, l))
             return false;
@@ -2569,7 +2593,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         void *d, *r, *l;
         fp4_parts(A_i8, N8, K, &d, &r, &l, false);
         if (!fold(d, l)) return false;
-        a_q = nullptr; a_pk = false; xn_tfp4_ready = false;
+        a_q = nullptr; a_pk = false; xn_tfp4_ready = false; xn_sfp4_ready = false;
         f4_A = A; f4_sign = sign; f4_K = K;
         return true;
     };
@@ -2896,9 +2920,26 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                t.wk_type == kPtq1GgmlType && t.wv_type == kPtq1GgmlType && tfp4_takes(H, wide) &&
                tfp4_takes(H, kvdim);
     };
+    // The short prompt's: the next layer's ternary in-projections are certain to take sfp4_act on
+    // xn (with the use_i8 their layer runs them under), so the norm writing xn also leaves their
+    // FP4 operand in A_i8 (xn_sfp4_ready).
+    auto xn_sfp4_for = [&](const Qwen35LayerWeights* nw) -> bool {
+        if (!tnorm_fold_env || !nw || !s.bonsai_pf_layers || !s.bonsai_pf_rs ||
+            !s.bonsai_sign_hidden)
+            return false;
+        const long li = nw - &s.w.layers[0];
+        if (li < 0 || li >= c.n_layers) return false;
+        const Qwen35LayerWeights& t = s.bonsai_pf_layers[li];
+        if (nw->linear_attn)
+            return (tproj_mask & 8) && t.wqkv && t.wqkv_gate && t.wqkv_type == kPtq1GgmlType &&
+                   t.wqkv_gate_type == kPtq1GgmlType && sfp4_fits(N, H, use_i8 && use_i8_gdn);
+        return (tproj_mask & 1) && t.wq && t.wk && t.wv && t.wq_type == kPtq1GgmlType &&
+               t.wk_type == kPtq1GgmlType && t.wv_type == kPtq1GgmlType &&
+               sfp4_fits(N, H, use_i8 || use_i8_attn);
+    };
     auto norm_xn = [&](const void* nrm, const Qwen35LayerWeights* nw) {
         xn_fp8_ready = false;
-        xn_tfp4_ready = false;
+        xn_tfp4_ready = false; xn_sfp4_ready = false;
         xn_fp4_ready = xn_exact_for(nw) &&
             kernels::launch_prefill_nvfp4_rmsnorm_quant_a_exact(x, nrm, xn, fp4_a, fp4_as, N, H,
                                                                 eps, st);
@@ -2912,6 +2953,13 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                          x, nrm, eps, xn, static_cast<const signed char*>(s.bonsai_sign_hidden), d,
                          N8, H, s.bonsai_block, st, l)) {
                 xn_tfp4_ready = true;
+                a_q = nullptr; a_pk = false;
+            }
+            else if (xn_sfp4_for(nw) &&
+                     kernels::launch_ptq1_norm_rotq_fp4(
+                         x, nrm, eps, xn, static_cast<const signed char*>(s.bonsai_sign_hidden),
+                         A_i8, N, H, s.bonsai_block, st)) {
+                xn_sfp4_ready = true;
                 a_q = nullptr; a_pk = false;
             }
             else kernels::launch_rmsnorm(x, nrm, xn, N, H, eps, st);
@@ -2962,6 +3010,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         bool hn_quantized = false;   // pre-FFN norm already emitted A_i8/sx for the grouped FFN
         bool hn_fp4_ready = false;   // pre-FFN norm already emitted gate/up's FP4 operand
         bool hn_deferred = false;    // pre-FFN norm left to the ternary FFN's rotations (tfp4)
+        bool hn_sdeferred = false;   // ...the short prompt's: to gate/up's rotation (sfp4)
         if (w.linear_attn) {
             // ---- Gated DeltaNet linear-attention layer ----
             // Short-ctx dense: hold GDN on bf16 unless SPARKINFER_PREFILL_I8_GDN=1.
@@ -3331,6 +3380,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             // leg (tproj_resid -> tfp4_act -> tfp4_gemm, sfp4 being past its row limit), so the
             // gated norm runs inside that leg's rotation and lnrm is never written.
             bool tgn_fold = false;
+            // ...and the short prompt's: the out projection below is certain to take its sfp4 leg
+            // (tproj_resid -> sfp4_act -> sfp4_gemm), so the gated norm runs inside that leg's
+            // rotation (launch_ptq1_gnorm_rotq_fp4) and lnrm is never written.
+            bool sgn_fold = false;
             if (q38_gnorm_fp8 && w.ssm_out_type == kernels::SI_QTYPE_FP8 &&
                 !(gdn_nvfp4 && (gdn_fp4_mask & 2) && w.gdn_out_fp4 && w.gdn_out_fp4_sf &&
                   fp4_gdn_a && fp4_gdn_as && fp4_gdn_ws) &&
@@ -3355,6 +3408,18 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                                      att, lz, w.ssm_norm, eps, c.linear_head_dim,
                                      static_cast<const signed char*>(s.bonsai_sign_out), d, N,
                                      lvdim, s.bonsai_block, st, l);
+                             })) &&
+                       !(sgn_fold =
+                             tnorm_fold_env && tl && (tproj_mask & 4) && lvdim == qdim &&
+                             tl->ssm_out_type == kPtq1GgmlType &&
+                             !(gdn_nvfp4 && (gdn_fp4_mask & 2) && w.gdn_out_fp4 &&
+                               w.gdn_out_fp4_sf && fp4_gdn_a && fp4_gdn_as && fp4_gdn_ws) &&
+                             s.bonsai_sign_out && sfp4_takes(N, lvdim) &&
+                             sfp4_act_fold([&](void* a) {
+                                 return kernels::launch_ptq1_gnorm_rotq_fp4(
+                                     att, lz, w.ssm_norm, eps, c.linear_head_dim,
+                                     static_cast<const signed char*>(s.bonsai_sign_out), a, N,
+                                     lvdim, s.bonsai_block, st);
                              }))) {
                 kernels::launch_prefill_gated_norm(att, lz, w.ssm_norm, lnrm, N, vh,
                                                    c.linear_head_dim, eps, st);
@@ -3382,6 +3447,14 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                                                               w.gdn_out_fp4_alpha)) {
                     out_fp4 = true;
                 }
+            }
+            if (!out_fp4 && sgn_fold) {
+                const void* Wo = tl->ssm_out;
+                void*       Co = x;
+                out_fp4 = attn_fused = sfp4_gemm(N, lvdim, &Wo, &Co, &H, 1, true);
+                if (!out_fp4)   // never, sfp4_takes having held: the norm, then the arms below
+                    kernels::launch_prefill_gated_norm(att, lz, w.ssm_norm, lnrm, N, vh,
+                                                       c.linear_head_dim, eps, st);
             }
             if (!out_fp4 && tgn_fold) {
                 out_fp4 = attn_fused = tfp4_gemm(tl->ssm_out, H, x, true);
@@ -3867,6 +3940,24 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 tgate_done = tfp4_gemm(tl->wo, H, x, true);
                 gate_fused = tgate_done;   // never false, tfp4_takes having held
             }
+            // ...and the short prompt's, on the o projection's sfp4 leg (launch_ptq1_gate_rotq_fp4,
+            // which reads the gate with a row pitch only; tq_raw is never set this short).
+            bool sgate_done = false;
+            if (!gate_fused && !wo_fp4_done && !tq_raw && tnorm_fold_env && !c.muse_glimmer &&
+                tl && (tproj_mask & 2) && tl->wo_type == kPtq1GgmlType && s.bonsai_sign_out &&
+                !(attn_nvfp4 && (attn_fp4_mask & 2) && w.wo_fp4 && w.wo_fp4_sf && fp4_attn_a &&
+                  fp4_attn_as && fp4_attn_ws) &&
+                sfp4_takes(N, qdim) &&
+                sfp4_act_fold([&](void* a) {
+                    return kernels::launch_ptq1_gate_rotq_fp4(
+                        att, gate_src, gate_ld, static_cast<const signed char*>(s.bonsai_sign_out),
+                        a, N, qdim, s.bonsai_block, st);
+                })) {
+                const void* Wo = tl->wo;
+                void*       Co = x;
+                sgate_done = sfp4_gemm(N, qdim, &Wo, &Co, &H, 1, true);
+                gate_fused = sgate_done;   // never false, sfp4_takes having held
+            }
             // Never, tq_raw having required one of the arms above: the rest read a gate with a
             // row pitch only, so gather the heads into qg for them.
             if (!gate_fused && !wo_fp4_done && tq_raw) {
@@ -3904,7 +3995,7 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     wo_fp4_q38 = true;
                 }
             }
-            if (tgate_done) {
+            if (tgate_done || sgate_done) {
                 attn_fused = true;
             } else if (wo_fp4_q38) {
                 attn_fused = wo_fp4_resid;
@@ -4036,7 +4127,11 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             // the layer, hn is written there before anything reads it.
             hn_deferred = !ffn_norm_fp4 && tnorm_fold_env && !moe && tl && trs &&
                           s.bonsai_sign_hidden && N > kernels::pf_dense_gemm_qi8_max_m();
-            if (!ffn_norm_fp4 && !hn_deferred)
+            // The short prompt's FFN (sfp4 in tgu_gate_up) likewise takes the norm from x in its
+            // gate/up rotation; resolved, as hn_deferred is, before anything reads hn.
+            hn_sdeferred = !ffn_norm_fp4 && !hn_deferred && tnorm_fold_env && !moe &&
+                           !c.muse_glimmer && tl && s.bonsai_sign_hidden && sfp4_takes(N, H);
+            if (!ffn_norm_fp4 && !hn_deferred && !hn_sdeferred)
                 kernels::launch_rmsnorm(x, w.post_attn_norm, hn, N, H, eps, st);
         }
 
@@ -4201,6 +4296,13 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                      : fp4_leg(gate_pf, ffn, H, &tg_d, &tg_s) &&
                        fp4_leg(up_pf, ffn, H, &tu_d, &tu_s)) &&
                 fp4_leg(tl->down_q, H, ffn, &td_d, &td_s);
+            // gate/up are certain to take sfp4 on the one chunk's hn (tgu_gate_up below, the
+            // first and only reader of hn on this path); otherwise write hn now.
+            if (hn_sdeferred && !(ffn_qi8 && t_gu && !gu_nvfp4 && FC >= N && gate_pf && up_pf &&
+                                  (ffn % 128) == 0)) {
+                kernels::launch_rmsnorm(x, w.post_attn_norm, hn, N, H, eps, st);
+                hn_sdeferred = false;
+            }
             if (hn_deferred && !tfp4) {
                 kernels::launch_rmsnorm(x, w.post_attn_norm, hn, N, H, eps, st);
                 hn_deferred = false;
@@ -4224,6 +4326,23 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             // h = bf16(silu(g) * u) into ffg instead of gate and up separately; *h_out says it did.
             auto tgu_gate_up = [&](const bf16* hin, int rows_c, int* fused_out,
                                    bool* h_out = nullptr) {
+                if (hn_sdeferred) {
+                    hn_sdeferred = false;
+                    if (hin == hn && rows_c == N && sfp4_takes(N, H) &&
+                        sfp4_act_fold([&](void* a) {
+                            return kernels::launch_ptq1_norm_rotq_fp4(
+                                x, w.post_attn_norm, eps, nullptr,
+                                static_cast<const signed char*>(s.bonsai_sign_hidden), a, N, H,
+                                s.bonsai_block, st);
+                        })) {
+                        const void* Wf[2] = { gate_pf, up_pf };
+                        void*       Cf[2] = { ffg, ffu };
+                        const int   nf[2] = { ffn, ffn };
+                        if (sfp4_gemm(N, H, Wf, Cf, nf, 2, false)) return;
+                    }
+                    // Never, the resolution above having held: hn, then the arms below.
+                    kernels::launch_rmsnorm(x, w.post_attn_norm, hn, N, H, eps, st);
+                }
                 if (sfp4_act(hin, nullptr, s.bonsai_sign_hidden, rows_c, H)) {
                     const void* Wf[2] = { gate_pf, up_pf };
                     void*       Cf[2] = { ffg, ffu };

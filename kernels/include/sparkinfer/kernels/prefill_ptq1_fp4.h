@@ -20,6 +20,21 @@ bool ptq1_fp4_gemm_supported(int m, int k);
 size_t ptq1_fp4_act_bytes(int rows, int k);
 bool launch_ptq1_rotq_fp4(const void* x_bf16, const void* up_bf16, const signed char* sign,
                           void* a, int rows, int k, int block, cudaStream_t stream);
+// launch_ptq1_rotq_fp4 with the kernel that produced its input folded in, so its bf16 output is
+// never written and read back; each computes that kernel's own values, so `a` receives the bytes
+// the two passes wrote. norm: rmsnorm_kernel(x, weight) (out_norm, when set, still receives its
+// bf16 row); gnorm: pf_gated_norm_kernel(x, z, weight) per head_dim-wide head (128 only); gate:
+// pf_mul_sigmoid_kernel(x, gate), gate's rows gate_ld apart (0: k). False, launching nothing,
+// where they do not apply.
+bool launch_ptq1_norm_rotq_fp4(const void* x_bf16, const void* weight_bf16, float eps,
+                               void* out_norm, const signed char* sign, void* a, int rows, int k,
+                               int block, cudaStream_t stream);
+bool launch_ptq1_gnorm_rotq_fp4(const void* x_bf16, const void* z_bf16, const void* weight_bf16,
+                                float eps, int head_dim, const signed char* sign, void* a,
+                                int rows, int k, int block, cudaStream_t stream);
+bool launch_ptq1_gate_rotq_fp4(const void* x_bf16, const void* gate_bf16, int gate_ld,
+                               const signed char* sign, void* a, int rows, int k, int block,
+                               cudaStream_t stream);
 bool launch_ptq1_fp4_gemm(const void* a, int m, int k, const void* const* w, void* const* c,
                           const int* n, int nleg, bool resid, float* part, size_t part_cap,
                           cudaStream_t stream);

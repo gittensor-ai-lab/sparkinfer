@@ -45,44 +45,157 @@ __device__ __forceinline__ int fp4_perm(int q) {
     return b < 16 ? 16 * m + b : 80 + 8 * m + (b - 16);
 }
 
+// ---- the producers' arithmetic, as their --use_fast_math translation units emit it -------------
+// This file builds without fast math. The kernels a rotation below can take the place of
+// (rmsnorm_kernel, pf_gated_norm_kernel, pf_mul_sigmoid_kernel) build with it, and their PTX is
+// these flush-to-zero instructions in this order, so each value here is the one they write.
+__device__ __forceinline__ float fm_fma(float a, float b, float c) {
+    float d; asm("fma.rn.ftz.f32 %0, %1, %2, %3;" : "=f"(d) : "f"(a), "f"(b), "f"(c)); return d;
+}
+__device__ __forceinline__ float fm_add(float a, float b) {
+    float d; asm("add.ftz.f32 %0, %1, %2;" : "=f"(d) : "f"(a), "f"(b)); return d;
+}
+__device__ __forceinline__ float fm_mul(float a, float b) {
+    float d; asm("mul.ftz.f32 %0, %1, %2;" : "=f"(d) : "f"(a), "f"(b)); return d;
+}
+__device__ __forceinline__ float fm_div(float a, float b) {
+    float d; asm("div.approx.ftz.f32 %0, %1, %2;" : "=f"(d) : "f"(a), "f"(b)); return d;
+}
+// rsqrtf(ss / n + eps)
+__device__ __forceinline__ float fm_inv_rms(float ss, float n, float eps) {
+    float d; asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(d) : "f"(fm_add(eps, fm_div(ss, n)))); return d;
+}
+// exp(-g) + 1: __expf(-g) is ex2.approx of g * -log2(e).
+__device__ __forceinline__ float fm_exp_neg_p1(float g) {
+    float e; asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(e) : "f"(fm_mul(g, -1.44269502f)));
+    return fm_add(e, 1.f);
+}
+// pf_silu: z / (1 + exp(-z)).
+__device__ __forceinline__ float fm_silu(float z) { return fm_div(z, fm_exp_neg_p1(z)); }
+// pf_sigmoid: 1 / (1 + exp(-g)), a reciprocal.
+__device__ __forceinline__ float fm_sigmoid(float g) {
+    float r; asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(fm_exp_neg_p1(g))); return r;
+}
+__device__ __forceinline__ float fm_wsum(float v) {
+#pragma unroll
+    for (int m = 16; m > 0; m >>= 1) v = fm_add(v, __shfl_xor_sync(0xffffffffu, v, m));
+    return v;
+}
+
 // ---- activation: rotate, then NVFP4 ---------------------------------------------------------
 // One CTA per (row, span), 256 threads holding four consecutive values of the 1024-span: the
 // rotation is ptq1_rotq_rows_i8_kernel's, value for value. The quantize then reads the span back in
 // slot order, so each four-lane quad owns one 16-slot group. Spans share nothing (the rotation, the
 // scales and the output bytes are all per span), so gridDim.y CTAs split a row's spans between
 // them; gridDim.y = 1 walks them in one CTA.
-template <bool SWIGLU>
+// MODE, the row rotated (where it is another kernel's output, that kernel's bf16 row, which then
+// need never be written -- out_norm can still receive it):
+//   kRqPlain   x itself.
+//   kRqSwiglu  bf16(silu(x) * u), x the gate and u the up projection.
+//   kRqNorm    rmsnorm_kernel(x, nw): the row's square sum in that kernel's order (256 threads,
+//              thread t's 8-value packs t, t + 256, ..., then the two xor trees), every CTA of a
+//              split row forming the whole row's, and bf16(x * inv_rms * nw).
+//   kRqGnorm   pf_gated_norm_kernel(x, z = u, nw) per 128-wide v head, which is one warp's values
+//              here: the square sum in that kernel's lane order (lane l: l, l + 32, l + 64, l + 96),
+//              then bf16(x * inv * nw * silu(z)).
+//   kRqGate    pf_mul_sigmoid_kernel(x, gate = u, row pitch u_ld): bf16(x * sigmoid(gate)).
+enum : int { kRqPlain = 0, kRqSwiglu = 1, kRqNorm = 2, kRqGnorm = 3, kRqGate = 4 };
+template <int MODE>
 __global__ void __launch_bounds__(256)
 ptq1_rotq_fp4_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ u,
                      const signed char* __restrict__ sign, unsigned char* __restrict__ q,
-                     int rows, int k) {
+                     int rows, int k, const __nv_bfloat16* __restrict__ nw = nullptr,
+                     float eps = 0.f, int u_ld = 0, __nv_bfloat16* __restrict__ out_norm = nullptr) {
     __shared__ float sh[kSpan];
-    const int t = threadIdx.x, lane = t & 31;
+    __shared__ float sred[8];
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
     const int row = blockIdx.x;
     unsigned char* qrow = q + (size_t)row * (k / 2);
     unsigned char* srow = q + (size_t)rows * (k / 2) + (size_t)row * (k / 16);
+    const __nv_bfloat16* xr = x + (size_t)row * k;
+    const __nv_bfloat16* ur = u ? u + (size_t)row * (u_ld ? u_ld : k) : nullptr;
     int src[4];
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
         const int s = t * 4 + i;
         src[i] = (s & ~(kBlk - 1)) + fp4_perm(s & (kBlk - 1));
     }
+    float inv_rms = 0.f;
+    if constexpr (MODE == kRqNorm) {
+        const uint4* x4 = reinterpret_cast<const uint4*>(xr);
+        float ss = 0.f;
+        for (int p = t; p < (k >> 3); p += 256) {
+            const uint4 pk = __ldg(x4 + p);
+            const __nv_bfloat16* hp = reinterpret_cast<const __nv_bfloat16*>(&pk);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const float xv = __bfloat162float(hp[j]);
+                ss = fm_fma(xv, xv, ss);
+            }
+        }
+        ss = fm_wsum(ss);
+        if (lane == 0) sred[warp] = ss;
+        __syncthreads();
+        if (t < 32) {
+            const float r = fm_wsum(t < 8 ? sred[t] : 0.f);
+            if (t == 0) sred[0] = fm_inv_rms(r, (float)k, eps);
+        }
+        __syncthreads();
+        inv_rms = sred[0];
+    }
     for (int sp = blockIdx.y; sp < k / kSpan; sp += gridDim.y) {
         const int e0 = sp * kSpan + t * 4;
-        uint2 raw = *reinterpret_cast<const uint2*>(x + (size_t)row * k + e0);
-        if constexpr (SWIGLU) {
-            const uint2 ur = *reinterpret_cast<const uint2*>(u + (size_t)row * k + e0);
-            const __nv_bfloat16* gh = reinterpret_cast<const __nv_bfloat16*>(&raw);
-            const __nv_bfloat16* uh = reinterpret_cast<const __nv_bfloat16*>(&ur);
+        uint2 raw = *reinterpret_cast<const uint2*>(xr + e0);
+        if constexpr (MODE != kRqPlain) {
+            const __nv_bfloat16* xh = reinterpret_cast<const __nv_bfloat16*>(&raw);
             __nv_bfloat16 o[4];
+            if constexpr (MODE == kRqSwiglu) {
+                const uint2 up = *reinterpret_cast<const uint2*>(ur + e0);
+                const __nv_bfloat16* uh = reinterpret_cast<const __nv_bfloat16*>(&up);
 #pragma unroll
-            for (int j = 0; j < 4; j++) {
-                const float g = __bfloat162float(gh[j]);
-                // __fdividef: what launch_ptq1_swiglu_rotq_rows_i8's --use_fast_math build emits,
-                // so the bf16 SwiGLU output is the int8 path's, value for value.
-                o[j] = __float2bfloat16(__fdividef(g, 1.f + __expf(-g)) * __bfloat162float(uh[j]));
+                for (int j = 0; j < 4; j++) {
+                    const float g = __bfloat162float(xh[j]);
+                    // __fdividef: what launch_ptq1_swiglu_rotq_rows_i8's --use_fast_math build
+                    // emits, so the bf16 SwiGLU output is the int8 path's, value for value.
+                    o[j] = __float2bfloat16(__fdividef(g, 1.f + __expf(-g)) *
+                                            __bfloat162float(uh[j]));
+                }
+            } else if constexpr (MODE == kRqNorm) {
+                const uint2 wp = *reinterpret_cast<const uint2*>(nw + e0);
+                const __nv_bfloat16* wh = reinterpret_cast<const __nv_bfloat16*>(&wp);
+#pragma unroll
+                for (int j = 0; j < 4; j++)
+                    o[j] = __float2bfloat16(
+                        fm_mul(fm_mul(inv_rms, __bfloat162float(xh[j])), __bfloat162float(wh[j])));
+            } else if constexpr (MODE == kRqGnorm) {
+                const __nv_bfloat16* hx = xr + sp * kSpan + warp * kBlk;   // this warp's head
+                float ss = 0.f;
+#pragma unroll
+                for (int r = 0; r < kBlk / 32; r++) {
+                    const float xv = __bfloat162float(hx[lane + 32 * r]);
+                    ss = fm_fma(xv, xv, ss);
+                }
+                const float inv = fm_inv_rms(fm_wsum(ss), (float)kBlk, eps);
+                const uint2 zp = *reinterpret_cast<const uint2*>(ur + e0);
+                const uint2 wp = *reinterpret_cast<const uint2*>(nw + lane * 4);
+                const __nv_bfloat16* zh = reinterpret_cast<const __nv_bfloat16*>(&zp);
+                const __nv_bfloat16* wh = reinterpret_cast<const __nv_bfloat16*>(&wp);
+#pragma unroll
+                for (int j = 0; j < 4; j++)
+                    o[j] = __float2bfloat16(
+                        fm_mul(fm_mul(fm_mul(inv, __bfloat162float(xh[j])), __bfloat162float(wh[j])),
+                               fm_silu(__bfloat162float(zh[j]))));
+            } else {   // kRqGate
+                const uint2 gp = *reinterpret_cast<const uint2*>(ur + e0);
+                const __nv_bfloat16* gh = reinterpret_cast<const __nv_bfloat16*>(&gp);
+#pragma unroll
+                for (int j = 0; j < 4; j++)
+                    o[j] = __float2bfloat16(
+                        fm_mul(__bfloat162float(xh[j]), fm_sigmoid(__bfloat162float(gh[j]))));
             }
             raw = *reinterpret_cast<const uint2*>(o);
+            if (MODE == kRqNorm && out_norm)
+                *reinterpret_cast<uint2*>(out_norm + (size_t)row * k + e0) = raw;
         }
         const __nv_bfloat162 a = *reinterpret_cast<const __nv_bfloat162*>(&raw.x);
         const __nv_bfloat162 b = *reinterpret_cast<const __nv_bfloat162*>(&raw.y);
@@ -617,11 +730,52 @@ bool launch_ptq1_rotq_fp4(const void* x_bf16, const void* up_bf16, const signed 
     const auto* x = static_cast<const __nv_bfloat16*>(x_bf16);
     auto* q = static_cast<unsigned char*>(a);
     if (up_bf16)
-        ptq1_rotq_fp4_kernel<true><<<grid, 256, 0, st>>>(
+        ptq1_rotq_fp4_kernel<kRqSwiglu><<<grid, 256, 0, st>>>(
             x, static_cast<const __nv_bfloat16*>(up_bf16), sign, q, rows, k);
     else
-        ptq1_rotq_fp4_kernel<false><<<grid, 256, 0, st>>>(x, nullptr, sign, q, rows, k);
+        ptq1_rotq_fp4_kernel<kRqPlain><<<grid, 256, 0, st>>>(x, nullptr, sign, q, rows, k);
     return cudaPeekAtLastError() == cudaSuccess;
+}
+
+namespace {
+// launch_ptq1_rotq_fp4 with the kernel producing its input folded in (MODE, above).
+template <int MODE>
+bool rotq_fp4_fused(const void* x, const void* u, int u_ld, const void* nw, float eps,
+                    void* out_norm, const signed char* sign, void* a, int rows, int k, int block,
+                    cudaStream_t st) {
+    if (rows <= 0 || block != kSpan || k % kSpan != 0 || !ptq1_fp4_gemm_supported(rows, k))
+        return false;
+    const dim3 grid(rows, rows < sm_count() ? k / kSpan : 1);
+    ptq1_rotq_fp4_kernel<MODE><<<grid, 256, 0, st>>>(
+        static_cast<const __nv_bfloat16*>(x), static_cast<const __nv_bfloat16*>(u), sign,
+        static_cast<unsigned char*>(a), rows, k, static_cast<const __nv_bfloat16*>(nw), eps, u_ld,
+        static_cast<__nv_bfloat16*>(out_norm));
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+}  // namespace
+
+bool launch_ptq1_norm_rotq_fp4(const void* x_bf16, const void* weight_bf16, float eps,
+                               void* out_norm, const signed char* sign, void* a, int rows, int k,
+                               int block, cudaStream_t st) {
+    if (!x_bf16 || !weight_bf16) return false;
+    return rotq_fp4_fused<kRqNorm>(x_bf16, nullptr, 0, weight_bf16, eps, out_norm, sign, a, rows,
+                                   k, block, st);
+}
+
+bool launch_ptq1_gnorm_rotq_fp4(const void* x_bf16, const void* z_bf16, const void* weight_bf16,
+                                float eps, int head_dim, const signed char* sign, void* a,
+                                int rows, int k, int block, cudaStream_t st) {
+    if (!x_bf16 || !z_bf16 || !weight_bf16 || head_dim != kBlk) return false;
+    return rotq_fp4_fused<kRqGnorm>(x_bf16, z_bf16, 0, weight_bf16, eps, nullptr, sign, a, rows,
+                                    k, block, st);
+}
+
+bool launch_ptq1_gate_rotq_fp4(const void* x_bf16, const void* gate_bf16, int gate_ld,
+                               const signed char* sign, void* a, int rows, int k, int block,
+                               cudaStream_t st) {
+    if (!x_bf16 || !gate_bf16) return false;
+    return rotq_fp4_fused<kRqGate>(x_bf16, gate_bf16, gate_ld, nullptr, 0.f, nullptr, sign, a,
+                                   rows, k, block, st);
 }
 
 bool launch_ptq1_fp4_gemm(const void* a, int m, int k, const void* const* w, void* const* c,
