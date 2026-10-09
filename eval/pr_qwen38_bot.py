@@ -2443,13 +2443,8 @@ def reconcile_qwen38_merge_labels(repo, dry_run=False):
     open_labels = {p["number"]: {l["name"] for l in p["labels"]} for p in open_prs}
     open_by_num = {p["number"]: p for p in open_prs}
 
-    merged = json.loads(arb.gh([
-        "pr", "list", "-R", repo, "--state", "merged", "--label", QWEN38_MERGE_FIRST,
-        "--json", "number", "--limit", "10",
-    ]).stdout or "[]")
-    for m in merged:
-        if not dry_run:
-            arb.remove_label(repo, m["number"], QWEN38_MERGE_FIRST)
+    # A merged PR keeps its merge-first label: it records which PR won the round (maintainer policy,
+    # 2026-10-09). Nothing here needs it gone -- the ranking below only reads OPEN PRs.
 
     scored = []
     stale_first = []   # carries merge-first but can no longer win it

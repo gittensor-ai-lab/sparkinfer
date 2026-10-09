@@ -1849,5 +1849,59 @@ class BenchSweepTests(unittest.TestCase):
         self.assertIn("MEDIAN=50.0", r.stdout, r.stderr)                 # 4 of 5 reps measured 50
 
 
+class MergedKeepsMergeFirstTests(unittest.TestCase):
+    """A merged PR keeps its merge-first label; its rivals are nudged once per merge, not per run."""
+    R = staticmethod(lambda out: mock.Mock(returncode=0, stdout=out, stderr=""))
+
+    def _run(self, merged_nums, open_prs):
+        calls, removed, merges = [], [], []
+
+        def gh(args, *a, **k):
+            calls.append(args)
+            if args[:2] == ["pr", "list"] and "merged" in args:
+                return self.R(json.dumps([{"number": n} for n in merged_nums]))
+            if args[:2] == ["pr", "list"]:
+                return self.R(json.dumps(open_prs))
+            return self.R("")
+        with mock.patch.object(bot, "gh", side_effect=gh), \
+                mock.patch.object(bot, "sync_merged_dashboard"), \
+                mock.patch.object(bot, "load_dash", return_value={}), \
+                mock.patch.object(bot, "record_merge", side_effect=lambda r, n: merges.append(n)), \
+                mock.patch.object(bot, "remove_label", side_effect=lambda r, n, l: removed.append((n, l))), \
+                mock.patch.object(bot, "add_label"):
+            bot.reconcile_merge_labels("o/r")
+        nudges = [c for c in calls if c[:2] == ["pr", "comment"]]
+        return removed, merges, nudges
+
+    def setUp(self):
+        self.seen = tempfile.NamedTemporaryFile(delete=False).name
+        os.unlink(self.seen)
+        p = mock.patch.object(bot, "MERGE_FIRST_SEEN_FILE", self.seen)
+        p.start()
+        self.addCleanup(p.stop)
+        self.addCleanup(lambda: os.path.exists(self.seen) and os.unlink(self.seen))
+
+    def test_merged_label_kept_and_rivals_nudged_once(self):
+        rivals = [{"number": 7, "labels": [{"name": bot.NEEDS_REBASE_LABEL}]}]
+        # First run ever: adopt what is already merged, nudge no one (no burst on rollout).
+        removed, merges, nudges = self._run([100], rivals)
+        self.assertEqual((removed, merges, nudges), ([], [], []))
+        # A new merge-first PR merges: recorded, rivals nudged, its label left on.
+        removed, merges, nudges = self._run([101, 100], rivals)
+        self.assertEqual(removed, [])
+        self.assertEqual(merges, [101])
+        self.assertEqual([c[2] for c in nudges], ["7"])
+        # The next run sees the same merged PRs: nothing repeats.
+        removed, merges, nudges = self._run([101, 100], rivals)
+        self.assertEqual((removed, merges, nudges), ([], [], []))
+
+    def test_model_bots_never_strip_merge_first_from_merged_prs(self):
+        import inspect
+        import pr_bonsai_bot, pr_qwen38_bot, pr_museglimmer_bot, pr_dflash_bot, pr_dspark_bot, pr_modelopt_bot
+        for mod in (pr_bonsai_bot, pr_qwen38_bot, pr_museglimmer_bot, pr_dflash_bot, pr_dspark_bot,
+                    pr_modelopt_bot):
+            self.assertNotIn('remove_label(repo, m["number"]', inspect.getsource(mod), mod.__name__)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -3552,6 +3552,26 @@ def try_auto_merge(repo, num):
     print(f">> auto-merge BLOCKED #{num} (branch protection/checks): {(r.stderr or r.stdout).strip()[:200]}")
     return False
 
+MERGE_FIRST_SEEN_FILE = os.path.expanduser(
+    os.environ.get("SPARKINFER_MERGE_FIRST_SEEN_FILE", "~/.sparkinfer_merge_first_seen.json"))
+
+
+def _load_merge_first_seen():
+    """Merged merge-first PRs already handled (rivals nudged), or None before the first run."""
+    try:
+        with open(MERGE_FIRST_SEEN_FILE) as f:
+            return {int(n) for n in json.load(f)}
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def _save_merge_first_seen(seen):
+    tmp = MERGE_FIRST_SEEN_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(sorted(seen), f)
+    os.replace(tmp, MERGE_FIRST_SEEN_FILE)
+
+
 def reconcile_merge_labels(repo):
     """Per-round merge workflow. After all queued PRs are graded against the same-box main:
       0. Sync recently merged PRs onto the dashboard (manual merges, not only merge-first).
@@ -3567,12 +3587,19 @@ def reconcile_merge_labels(repo):
     open_labels = {p["number"]: {l["name"] for l in p["labels"]} for p in open_prs}
 
     # 1) A merge-first PR that merged → its rivals must rebase + re-eval against the new main.
+    #    The merged PR KEEPS its merge-first label (it records the round's winner -- maintainer
+    #    policy, 2026-10-09), so "already handled" is remembered in MERGE_FIRST_SEEN_FILE instead
+    #    of by stripping the label; otherwise every run would re-nudge the same rivals.
     merged_first = json.loads(gh(["pr", "list", "-R", repo, "--state", "merged", "--label",
                                   MERGE_FIRST_LABEL, "--json", "number", "--limit", "10"]).stdout or "[]")
-    if merged_first:
-        for m in merged_first:
-            record_merge(repo, m["number"])      # idempotent; sync_merged_dashboard usually did this
-            remove_label(repo, m["number"], MERGE_FIRST_LABEL)
+    seen = _load_merge_first_seen()
+    nums = {m["number"] for m in merged_first}
+    fresh = sorted(nums - seen) if seen is not None else []   # first run: adopt the list, nudge no one
+    if nums - (seen or set()):
+        _save_merge_first_seen((seen or set()) | nums)
+    if fresh:
+        for num in fresh:
+            record_merge(repo, num)              # idempotent; sync_merged_dashboard usually did this
         # Rivals stay `needs-rebase` (they have NOT rebased yet — that's exactly why `re-evaluate`
         # would be wrong here). Just nudge them to rebase; the eval re-runs on the rebased commit.
         for num, labs in open_labels.items():
