@@ -98,7 +98,8 @@ if(BUILD_NVFP4_KERNELS)
     # host functions, and prefill_nvfp4_supported() gates on cc 12.0 at runtime, so a non-Blackwell
     # device simply never calls in.
     add_library(si_nvfp4 STATIC csrc/cuda/fused/prefill_nvfp4_sm120.cu
-                         csrc/cuda/fused/prefill_ptq1_fp4_sm120.cu)
+                         csrc/cuda/fused/prefill_ptq1_fp4_sm120.cu
+                         csrc/cuda/fused/packed_ptq1_fp4_sm120.cu)
     target_include_directories(si_nvfp4 PRIVATE include
         ${cutlass_SOURCE_DIR}/include ${cutlass_SOURCE_DIR}/tools/util/include)
     target_compile_options(si_nvfp4 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)

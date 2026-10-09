@@ -1,5 +1,5 @@
 file(GLOB SRC "*.cu")
-list(FILTER SRC EXCLUDE REGEX "prefill_(nvfp4|ptq1_fp4)_sm120[.]cu")
+list(FILTER SRC EXCLUDE REGEX "(prefill_nvfp4|prefill_ptq1_fp4|packed_ptq1_fp4)_sm120[.]cu")
 add_library(si_fused STATIC ${SRC})
 target_include_directories(si_fused PUBLIC ${PROJECT_SOURCE_DIR}/include)
 target_compile_options(si_fused PRIVATE
