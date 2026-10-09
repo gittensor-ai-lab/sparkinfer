@@ -1365,6 +1365,9 @@ ptq1_fold_rotq_fp4_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat
         const int sl = t * 4 + i;
         src[i] = (sl & ~(kBlk - 1)) + fp4_perm(sl & (kBlk - 1));
     }
+    // No-ops unless launched programmatic; the GEMM after may launch early (its own wait holds it).
+    pdl_wait();
+    pdl_trigger();
     float inv_rms = 0.f;
     if constexpr (MODE == kRotNorm) {   // ptq1_rotq_rows_i8_kernel's, i.e. rmsnorm_kernel's order
         const uint4* x4 = reinterpret_cast<const uint4*>(xr);
