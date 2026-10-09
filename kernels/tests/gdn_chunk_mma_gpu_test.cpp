@@ -98,7 +98,7 @@ int run_arm(int fd, const char* mode) {
             cudaMalloc(&out, (size_t)N * sh.vh * HD * sizeof(__nv_bfloat16));
             if (!sparkinfer::kernels::launch_prefill_gdn_chunk(q, k, v, al, be, dt, a, state, out, N,
                                                               sh.qh, sh.vh, HD, true, nullptr,
-                                                              call > 0, 0)) {
+                                                              call > 0, 0, nullptr, nullptr, false, true)) {
                 fprintf(stderr, "launch refused (mode %s, N=%d)\n", mode, N);
                 return 1;
             }
@@ -116,7 +116,7 @@ int run_arm(int fd, const char* mode) {
                 for (int r = 0; r < R; r++)
                     sparkinfer::kernels::launch_prefill_gdn_chunk(q, k, v, al, be, dt, a, state, out,
                                                                   N, sh.qh, sh.vh, HD, true,
-                                                                  nullptr, false, 0);
+                                                                  nullptr, false, 0, nullptr, nullptr, false, true);
                 cudaEventRecord(e1);
                 cudaEventSynchronize(e1);
                 float ms = 0.f;

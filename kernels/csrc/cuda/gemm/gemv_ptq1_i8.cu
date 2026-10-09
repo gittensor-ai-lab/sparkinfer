@@ -75,13 +75,15 @@ __device__ __forceinline__ size_t sf_cutlass_off(int r, int g, int ng) {
 // this file builds for plain sm_120 with the rest of si_gemm, where cuda_fp4.hpp widens every
 // value to double and rounds it in software -- FP64 at 1/64 rate on a GeForce part, and the
 // long-prompt FP4 activation below converts every value of every leg. The thresholds are e2m1's
-// midpoints (0.25 .. 5), each tie going to the even code, so the codes are the intrinsic's.
+// midpoints (0.25 .. 5), each tie going to the even code, so the codes are the intrinsic's. The
+// code is the count of thresholds the magnitude clears, summed: the same codes as a chain of
+// selects, which compiled to divergent branches -- the rotations' largest instruction share.
 __device__ __forceinline__ unsigned e2m1_rn(float v) {
     const float a = fabsf(v);
-    if (a != a) return 7u;
-    const unsigned c = a <= 0.25f ? 0u : a < 0.75f ? 1u : a <= 1.25f ? 2u : a < 1.75f ? 3u
-                     : a <= 2.5f  ? 4u : a < 3.5f  ? 5u : a <= 5.f   ? 6u : 7u;
-    return c | ((__float_as_uint(v) >> 28) & 8u);
+    const unsigned c = (unsigned)(a > 0.25f) + (unsigned)(a >= 0.75f) + (unsigned)(a > 1.25f) +
+                       (unsigned)(a >= 1.75f) + (unsigned)(a > 2.5f) + (unsigned)(a >= 3.5f) +
+                       (unsigned)(a > 5.f);
+    return a != a ? 7u : c | ((__float_as_uint(v) >> 28) & 8u);
 }
 // The pair packed as the intrinsic packs it: x in the low nibble, y in the high one.
 __device__ __forceinline__ unsigned e2m1x2_rn(float x, float y) {
@@ -1248,11 +1250,13 @@ ptq1_rotq_rows_i8_kernel(const __nv_bfloat16* __restrict__ x, const signed char*
             float r[4] = {a0 + a2, a1 + a3, a0 - a2, a1 - a3};
 #pragma unroll
             for (int m = 1; m < 32; m <<= 1) {
-                const bool hi = lane & m;
+                // p - r on the upper lane, r + p on the lower: one fma with r's sign, which rounds
+                // the exact sum once, as the add does.
+                const float sg = (lane & m) ? -1.f : 1.f;
 #pragma unroll
                 for (int i = 0; i < 4; ++i) {
                     const float p = __shfl_xor_sync(0xffffffffu, r[i], m);
-                    r[i] = hi ? p - r[i] : r[i] + p;
+                    r[i] = __fmaf_rn(sg, r[i], p);
                 }
             }
             __syncthreads();   // the previous span's readers are done with sh
@@ -1329,6 +1333,197 @@ ptq1_rotq_rows_i8_kernel(const __nv_bfloat16* __restrict__ x, const signed char*
                                           (e0 & 31)) = c4;
         }
     }
+}
+
+// The NVFP4 arm of ptq1_rotq_rows_i8_kernel with one warp per 1024-span. Lane l holds the span's
+// values 128 h + 4 l + j (h = 0..7, j = 0..3): what thread (warp h, lane l) of that kernel holds.
+// The butterflies run in its order -- j, then the lanes, then h -- each on the same two values, so
+// every nibble and scale byte is its own; only the h levels move, from a shared-memory pass with
+// three barriers a span into registers. Each warp takes span item 8 * block + warp of rows x
+// k/1024, except under kRotNorm, whose row square sum comes first: a CTA a row runs that kernel's
+// prologue -- its 256 threads' square sums and two xor trees, each real warp w also standing in for
+// virtual warps w + ns, w + 2 ns, ... -- then each of its ns warps takes one span.
+template <int MODE>
+__global__ void __launch_bounds__(256)
+ptq1_rotq_rows_fp4_warp_kernel(const __nv_bfloat16* __restrict__ x, const signed char* __restrict__ sign,
+                               unsigned char* __restrict__ q, unsigned char* __restrict__ sfr,
+                               int rows, int k, const __nv_bfloat16* __restrict__ u,
+                               unsigned char* __restrict__ sfl, const __nv_bfloat16* __restrict__ nw,
+                               float eps, int u_ld, __nv_bfloat16* __restrict__ out_norm) {
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int ns = k / kSpan;
+    int row, sp, sp_step;
+    float inv_rms = 0.f;
+    if constexpr (MODE == kRotNorm) {
+        __shared__ float sred[8];
+        row = blockIdx.x;
+        const uint4* x4 = reinterpret_cast<const uint4*>(x + (size_t)row * k);
+        for (int vw = warp; vw < 8; vw += ns) {   // virtual warp vw of a 256-thread block
+            const int vt = vw * 32 + lane;
+            float ss = 0.f;
+            for (int p = vt; p < (k >> 3); p += 256) {
+                const uint4 pk = __ldg(x4 + p);
+                const __nv_bfloat16* hp = reinterpret_cast<const __nv_bfloat16*>(&pk);
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const float xv = __bfloat162float(hp[j]);
+                    ss = __fmaf_rn(xv, xv, ss);
+                }
+            }
+#pragma unroll
+            for (int m = 16; m > 0; m >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, m);
+            if (lane == 0) sred[vw] = ss;
+        }
+        __syncthreads();
+        if (t < 32) {
+            float r = t < 8 ? sred[t] : 0.f;
+#pragma unroll
+            for (int m = 16; m > 0; m >>= 1) r += __shfl_xor_sync(0xffffffffu, r, m);
+            if (t == 0) sred[0] = rsqrtf(r / k + eps);
+        }
+        __syncthreads();
+        inv_rms = sred[0];
+        sp = warp;
+        sp_step = ns;
+    } else {
+        const int item = blockIdx.x * 8 + warp;
+        if (item >= rows * ns) return;
+        row = item / ns;
+        sp = item - row * ns;
+        sp_step = ns;
+    }
+    const __nv_bfloat16* xr = x + (size_t)row * k;
+    const __nv_bfloat16* ur = u ? u + (size_t)row * (u_ld ? u_ld : k) : nullptr;
+    for (; sp < ns; sp += sp_step) {
+        uint2 raw[8];
+#pragma unroll
+        for (int h = 0; h < 8; ++h) raw[h] = *reinterpret_cast<const uint2*>(xr + sp * kSpan + h * kBlk + lane * 4);
+        float r[8][4];
+#pragma unroll
+        for (int h = 0; h < 8; ++h) {
+            const int e0 = sp * kSpan + h * kBlk + lane * 4;
+            if constexpr (MODE != kRotPlain) {
+                const __nv_bfloat16* xh = reinterpret_cast<const __nv_bfloat16*>(&raw[h]);
+                __nv_bfloat16 o[4];
+                if constexpr (MODE == kRotSwiglu) {
+                    const uint2 up = *reinterpret_cast<const uint2*>(ur + e0);
+                    const __nv_bfloat16* uh = reinterpret_cast<const __nv_bfloat16*>(&up);
+#pragma unroll
+                    for (int j = 0; j < 4; j++) {
+                        const float g = __bfloat162float(xh[j]);
+                        o[j] = __float2bfloat16(g / (1.f + __expf(-g)) * __bfloat162float(uh[j]));
+                    }
+                } else if constexpr (MODE == kRotNorm) {
+                    const uint2 wp = *reinterpret_cast<const uint2*>(nw + e0);
+                    const __nv_bfloat16* wh = reinterpret_cast<const __nv_bfloat16*>(&wp);
+#pragma unroll
+                    for (int j = 0; j < 4; j++)
+                        o[j] = __float2bfloat16(__bfloat162float(xh[j]) * inv_rms *
+                                                __bfloat162float(wh[j]));
+                } else if constexpr (MODE == kRotGnorm) {
+                    const __nv_bfloat16* hx = xr + sp * kSpan + h * kBlk;   // this head
+                    float ss = 0.f;
+#pragma unroll
+                    for (int rr = 0; rr < kBlk / 32; rr++) {
+                        const float xv = __bfloat162float(hx[lane + 32 * rr]);
+                        ss += xv * xv;
+                    }
+#pragma unroll
+                    for (int m = 16; m > 0; m >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, m);
+                    const float inv = rsqrtf(ss / kBlk + eps);
+                    const uint2 zp = *reinterpret_cast<const uint2*>(ur + e0);
+                    const uint2 wp = *reinterpret_cast<const uint2*>(nw + lane * 4);
+                    const __nv_bfloat16* zh = reinterpret_cast<const __nv_bfloat16*>(&zp);
+                    const __nv_bfloat16* wh = reinterpret_cast<const __nv_bfloat16*>(&wp);
+#pragma unroll
+                    for (int j = 0; j < 4; j++) {
+                        const float z = __bfloat162float(zh[j]);
+                        o[j] = __float2bfloat16(__bfloat162float(xh[j]) * inv *
+                                                __bfloat162float(wh[j]) * (z / (1.f + __expf(-z))));
+                    }
+                } else {   // kRotGate
+                    const uint2 gp = *reinterpret_cast<const uint2*>(ur + e0);
+                    const __nv_bfloat16* gh = reinterpret_cast<const __nv_bfloat16*>(&gp);
+#pragma unroll
+                    for (int j = 0; j < 4; j++)
+                        o[j] = __float2bfloat16(__bfloat162float(xh[j]) *
+                                                (1.f / (1.f + __expf(-__bfloat162float(gh[j])))));
+                }
+                raw[h] = *reinterpret_cast<const uint2*>(o);
+                if (out_norm) *reinterpret_cast<uint2*>(out_norm + (size_t)row * k + e0) = raw[h];
+            }
+            const __nv_bfloat162 a = *reinterpret_cast<const __nv_bfloat162*>(&raw[h].x);
+            const __nv_bfloat162 b = *reinterpret_cast<const __nv_bfloat162*>(&raw[h].y);
+            const char4 sg = *reinterpret_cast<const char4*>(sign + e0);
+            float w0 = __low2float(a) * (float)sg.x, w1 = __high2float(a) * (float)sg.y;
+            float w2 = __low2float(b) * (float)sg.z, w3 = __high2float(b) * (float)sg.w;
+            const float a0 = w0 + w1, a1 = w0 - w1, a2 = w2 + w3, a3 = w2 - w3;
+            r[h][0] = a0 + a2; r[h][1] = a1 + a3; r[h][2] = a0 - a2; r[h][3] = a1 - a3;
+        }
+#pragma unroll
+        for (int m = 1; m < 32; m <<= 1) {
+            const float sgn = (lane & m) ? -1.f : 1.f;
+#pragma unroll
+            for (int h = 0; h < 8; ++h)
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const float p = __shfl_xor_sync(0xffffffffu, r[h][i], m);
+                    r[h][i] = __fmaf_rn(sgn, r[h][i], p);
+                }
+        }
+#pragma unroll
+        for (int i = 0; i < 4; ++i)
+#pragma unroll
+            for (int len = 1; len < 8; len <<= 1)
+#pragma unroll
+                for (int h = 0; h < 8; ++h)
+                    if (!(h & len)) {
+                        const float xx = r[h][i], yy = r[h + len][i];
+                        r[h][i] = xx + yy; r[h + len][i] = xx - yy;
+                    }
+#pragma unroll
+        for (int h = 0; h < 8; ++h) {
+            float v[4];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) v[i] = r[h][i] * 0.03125f;
+            float ga = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
+            ga = fmaxf(ga, __shfl_xor_sync(0xffffffffu, ga, 1));
+            ga = fmaxf(ga, __shfl_xor_sync(0xffffffffu, ga, 2));
+            const __nv_fp8_storage_t qb =
+                __nv_cvt_float_to_fp8(fmaxf(ga * (1.f / 6.f), 0x1p-9f), __NV_SATFINITE, __NV_E4M3);
+            const float qs = __half2float(__half(__nv_cvt_fp8_to_halfraw(qb, __NV_E4M3)));
+            const int e0 = sp * kSpan + h * kBlk + lane * 4;
+            const unsigned lo = e2m1x2_rn(v[0] / qs, v[1] / qs);
+            const unsigned hi = e2m1x2_rn(v[2] / qs, v[3] / qs);
+            *reinterpret_cast<unsigned short*>(q + ((size_t)row * k + e0) / 2) =
+                (unsigned short)(lo | (hi << 8));
+            if ((lane & 3) == 0) {
+                if (sfl) sfl[sf_cutlass_off(row, e0 / 16, k / 16)] = qb;
+                else sfr[(size_t)row * (k / 16) + e0 / 16] = qb;
+            }
+        }
+    }
+}
+
+// SPARKINFER_PTQ1_ROTQ_WARP=0 keeps the NVFP4 rotations on ptq1_rotq_rows_i8_kernel (A/B in one binary).
+bool rotq_fp4_warp_on() {
+    static const bool on = [] {
+        const char* e = getenv("SPARKINFER_PTQ1_ROTQ_WARP");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+template <int MODE>
+void rotq_fp4_warp_launch(const __nv_bfloat16* x, const signed char* sign, void* q, void* sfr,
+                          int rows, int k, const __nv_bfloat16* u, unsigned char* sfl,
+                          const __nv_bfloat16* nw, float eps, int u_ld, __nv_bfloat16* out_norm,
+                          cudaStream_t st) {
+    const long items = (long)rows * (k / kSpan);
+    const unsigned grid = MODE == kRotNorm ? (unsigned)rows : (unsigned)((items + 7) / 8);
+    const unsigned block = MODE == kRotNorm ? 32u * (unsigned)(k / kSpan) : 256u;
+    ptq1_rotq_rows_fp4_warp_kernel<MODE><<<grid, block, 0, st>>>(
+        x, sign, static_cast<unsigned char*>(q), static_cast<unsigned char*>(sfr), rows, k, u, sfl,
+        nw, eps, u_ld, out_norm);
 }
 
 // Prefill's NVFP4 B operand from the stored blocks. A trit is exact in e2m1, so the only rounding
@@ -1637,6 +1832,11 @@ bool launch_ptq1_rotq_rows_nvfp4(const void* x_bf16, const void* up_bf16, const 
     const auto* u = static_cast<const __nv_bfloat16*>(up_bf16);
     auto* qq = static_cast<signed char*>(q);
     auto* sf = static_cast<signed char*>(sf_rowmajor);
+    if (rotq_fp4_warp_on()) {
+        if (u) rotq_fp4_warp_launch<kRotSwiglu>(x, sign, q, sf, rows, k, u, sfl, nullptr, 0.f, 0, nullptr, st);
+        else   rotq_fp4_warp_launch<kRotPlain>(x, sign, q, sf, rows, k, nullptr, sfl, nullptr, 0.f, 0, nullptr, st);
+        return true;
+    }
     if (u) {
         if (k <= 8 * kSpan)
             ptq1_rotq_rows_i8_kernel<8, true, true><<<rows, 256, 0, st>>>(x, sign, qq, nullptr, sf, rows, k, u, sfl);
@@ -1664,6 +1864,11 @@ bool rotq_rows_nvfp4_fused(const __nv_bfloat16* x, const __nv_bfloat16* u, int u
     if (!sf_cutlass_clear(sf_cutlass, rows, k, st)) return false;
     auto* qq = static_cast<signed char*>(q);
     auto* sfl = static_cast<unsigned char*>(sf_cutlass);
+    // The gated norm and the gate stream two operands and run at the DRAM's rate on either kernel.
+    if (MODE == kRotNorm && rotq_fp4_warp_on()) {
+        rotq_fp4_warp_launch<MODE>(x, sign, q, nullptr, rows, k, u, sfl, nw, eps, u_ld, out_norm, st);
+        return true;
+    }
     if (k <= 5 * kSpan)
         ptq1_rotq_rows_i8_kernel<5, MODE, true><<<rows, 256, 0, st>>>(
             x, sign, qq, nullptr, nullptr, rows, k, u, sfl, nw, eps, u_ld, out_norm, u_hs);

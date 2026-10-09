@@ -2384,7 +2384,8 @@ void launch_prefill_gdn_scan(const void* q, const void* k, const void* v,
                              float* state, void* out, int n_tokens, int q_heads, int v_heads,
                              int head_dim, bool qh_block, cudaStream_t stream,
                              bool carry_in, int slot, cudaEvent_t prep_done,
-                             const GdnVFold* vfold, bool scan_trigger) {
+                             const GdnVFold* vfold, bool scan_trigger,
+                             bool prep_overlap) {
     static const bool state_bf16 = [] {
         const char* e = getenv("SPARKINFER_GDN_STATE_BF16");
         return e && e[0] == '1';
@@ -2393,7 +2394,8 @@ void launch_prefill_gdn_scan(const void* q, const void* k, const void* v,
     // the sequential scan below when disabled (SPARKINFER_PREFILL_GDN_CHUNK=0) or shape-unsupported.
     if (launch_prefill_gdn_chunk(q, k, v, alpha, beta, dt, a, state, out,
                                  n_tokens, q_heads, v_heads, head_dim, qh_block, stream,
-                                 carry_in, slot, prep_done, vfold, scan_trigger)) return;
+                                 carry_in, slot, prep_done, vfold, scan_trigger,
+                                 prep_overlap)) return;
     // The sequential scan reads v: where the conv left the v channels to the chunked scan, run
     // them now (the v heads of the same tiled conv -- launch_prefill_gdn_conv_qk ran the rest).
     if (vfold && vfold->qkv)

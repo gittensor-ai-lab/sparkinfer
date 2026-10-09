@@ -98,7 +98,8 @@ void launch_prefill_gdn_scan(const void* q, const void* k, const void* v,
                              bool qh_block = false, cudaStream_t stream = nullptr,
                              bool carry_in = false, int slot = 0,
                              cudaEvent_t prep_done = nullptr,
-                             const GdnVFold* vfold = nullptr, bool scan_trigger = false);
+                             const GdnVFold* vfold = nullptr, bool scan_trigger = false,
+                             bool prep_overlap = false);
 
 // launch_prefill_gdn_conv for the q and k heads only (vfold: the v channels are left to the
 // chunked scan's prep, see GdnVFold). False, launching nothing, where the tiled conv is off.

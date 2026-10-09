@@ -3297,7 +3297,8 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                     la + (size_t)R * vh, lb + (size_t)R * vh, w.ssm_dt, w.ssm_a,
                     layer_state, att + (size_t)R * lvdim, N - R, c.linear_q_heads, vh,
                     c.linear_head_dim, c.gdn_qh_block, st, /*carry_in=*/pos0 != 0, 0,
-                    z_defer ? gdn_ev[4] : nullptr, vfolded ? &vfold : nullptr, z_scan);
+                    z_defer ? gdn_ev[4] : nullptr, vfolded ? &vfold : nullptr, z_scan,
+                    /*prep_overlap=*/R == 0);
                 if (z_scan) {
                     const void* Wz = static_cast<const char*>(w.wqkv_gate) + (size_t)lvdim * 2;
                     kernels::launch_prefill_gemm_fp8(A_i8, Wz, sx, sw, lz, N, lvdim, H, st, nullptr,

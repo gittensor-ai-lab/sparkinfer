@@ -125,7 +125,8 @@ __global__ void pf_gdnc_prep_kernel(const __nv_bfloat16* __restrict__ q,
                                     __nv_bfloat16* __restrict__ u_buf,
                                     float* __restrict__ m_buf,
                                     int n_tokens, int q_heads, int v_heads, bool qh_block,
-                                    bool warp_inv, GdnVFold vf, int row0, int n_pass) {
+                                    bool warp_inv, GdnVFold vf, int row0, int n_pass,
+                                    int* __restrict__ ready = nullptr) {
     extern __shared__ char s_raw[];
     __nv_bfloat16* s_k = reinterpret_cast<__nv_bfloat16*>(s_raw);              // [C][HD+PAD]
     __nv_bfloat16* s_x = s_k + (size_t)C * (HD + PAD);                         // [C][HD+PAD] q then v
@@ -134,8 +135,10 @@ __global__ void pf_gdnc_prep_kernel(const __nv_bfloat16* __restrict__ q,
     float* s_b = s_g + C;                                                      // [C]
     float* s_t = s_b + C;                                                      // [C] scratch row
 
-    const int c    = blockIdx.x;
-    const int h    = blockIdx.y;
+    // With `ready` the grid is (v_heads, n_chunks): every head's chunk c is dispatched before any
+    // head's chunk c+1, so the scan running beside this kernel (see run_slice) can follow behind.
+    const int c    = ready ? blockIdx.y : blockIdx.x;
+    const int h    = ready ? blockIdx.x : blockIdx.y;
     const int tid  = threadIdx.x;
     const int nthr = blockDim.x;
     const int t0   = c * C;
@@ -204,7 +207,15 @@ __global__ void pf_gdnc_prep_kernel(const __nv_bfloat16* __restrict__ q,
             wmma::load_matrix_sync(bf, s_k + (size_t)tj * (HD + PAD) + d, HD + PAD);  // col_major => K^T
             wmma::mma_sync(cf, af, bf, cf);
         }
-        __shared__ float sD[8][16][16];
+        // The eight tiles land in the Q plane (s_x) rather than an 8 KB static buffer of their own:
+        // Q's last reader is the mma above (hence the barrier), and V does not stream into s_x until
+        // the A/M pass below has read every tile back. That takes the block from 31 KB of shared
+        // memory to 23 KB -- four resident blocks an SM instead of three, and room for one beside a
+        // scan block when the two overlap (run_slice). Same values: bit-identical.
+        static_assert(8 * 16 * 16 * sizeof(float) <= (size_t)C * (HD + PAD) * sizeof(__nv_bfloat16),
+                      "the tile buffer must fit the Q plane");
+        float (*sD)[16][16] = reinterpret_cast<float (*)[16][16]>(s_x);
+        __syncthreads();
         wmma::store_matrix_sync(&sD[warp][0][0], cf, 16, wmma::mem_row_major);
         __syncthreads();
 
@@ -435,6 +446,15 @@ __global__ void pf_gdnc_prep_kernel(const __nv_bfloat16* __restrict__ q,
             const int i = i0 + si * ISTR;
             if (i < len)
                 u_buf[((size_t)(t0 + i) * v_heads + h) * HD + d] = __float2bfloat16(acc[si]);
+        }
+    }
+    if (ready) {
+        // Every thread's stores to g/w/u/m for (c, h) happen-before the flag: barrier, then a
+        // device-scope release by thread 0.
+        __syncthreads();
+        if (tid == 0) {
+            __threadfence();
+            asm volatile("st.release.gpu.global.b32 [%0], %1;" :: "l"(ready + (size_t)c * v_heads + h), "r"(1) : "memory");
         }
     }
 }
@@ -935,7 +955,9 @@ struct GmLayout {
     static constexpr int RS = HD + 8;       // W / Q / K row stride (bf16): conflict-free ldmatrix
     static constexpr int MS = C + 8;        // M row stride (fp32): conflict-free float2 reads
     static constexpr int US = NCOL + 8;     // U0 row stride (bf16)
-    static constexpr int YS = CW + 8;       // per-warp Y staging row stride (bf16)
+    // Per-warp Y staging row stride (bf16). CW, not CW + 8: the 2 KB the padding cost is what lets a
+    // prep block (23 KB) sit beside a scan block on one SM while the two overlap (see run_slice).
+    static constexpr int YS = CW;
     static constexpr int OFF_Q = C * RS * 2, OFF_K = 2 * C * RS * 2, OFF_M = 3 * C * RS * 2;
     static constexpr int OFF_U = OFF_M + C * MS * 4, OFF_G = OFF_U + C * US * 2;
     static constexpr int STAGE = OFF_G + C * 4;
@@ -956,7 +978,7 @@ void pf_gdnc_scan_mma_kernel(const __nv_bfloat16* __restrict__ q,
                              float* __restrict__ state,
                              __nv_bfloat16* __restrict__ out,
                              int n_tokens, int q_heads, int v_heads, int n_chunks,
-                             bool qh_block, int carry) {
+                             bool qh_block, int carry, const int* __restrict__ ready = nullptr) {
     using L = GmLayout<WPC>;
     constexpr int C = L::C, HD = L::HD, CW = L::CW, NCOL = L::NCOL;
     constexpr int NTHR = WPC * 32;
@@ -993,6 +1015,18 @@ void pf_gdnc_scan_mma_kernel(const __nv_bfloat16* __restrict__ q,
     // Stage chunk c2 into buffer c2 & 1. Rows past n_tokens are zero-filled (no read), which makes
     // W^, U0, Q and K vanish there exactly as the prep kernel's tail rows do.
     auto stage = [&](int c2) {
+        if (ready) {
+            if (tid == 0) {
+                const int* f = ready + (size_t)c2 * v_heads + h;
+                int v;
+                for (;;) {
+                    asm volatile("ld.acquire.gpu.global.b32 %0, [%1];" : "=r"(v) : "l"(f) : "memory");
+                    if (v) break;
+                    __nanosleep(128);
+                }
+            }
+            __syncthreads();
+        }
         char* sb = s_raw + (c2 & 1) * L::STAGE;
         const int t0s = c2 * C;
         const int lens = min(C, n_tokens - t0s);
@@ -1215,13 +1249,48 @@ bool ws_reserve(size_t bytes, int slot) {
 constexpr size_t GDNC_ALIGN = 16;
 inline size_t gdnc_align_up(size_t x) { return (x + (GDNC_ALIGN - 1)) & ~(GDNC_ALIGN - 1); }
 
+// The side stream the overlapped scan runs on, and fork/join events, one pair per workspace slot
+// (slots are the callers that may run at once, each on its own stream). The stream is ONE for the
+// process, not one per slot: the scan blocks spin on the prep's flags, and two such grids in flight
+// at once (two long prompts of a pack, each on its own segment stream) could hold every SM between
+// them while the blocks still waiting to be placed sit ahead of both preps -- a deadlock. On one
+// stream the scans of different slots run one after another, and each slot's prep (on its own
+// stream) still runs at once. Non-blocking so the legacy default stream does not serialize against
+// it; the greatest priority so the scan's few blocks are placed ahead of the prep's. False (and the
+// caller keeps prep-then-scan) if any of it cannot be created.
+bool gdnc_side_stream(int slot, cudaStream_t& side, cudaEvent_t& fork, cudaEvent_t& join) {
+    static cudaStream_t st = nullptr;
+    static cudaEvent_t ef[kGdncSlots] = {}, ej[kGdncSlots] = {};
+    static bool bad = false;
+    if (slot < 0 || slot >= kGdncSlots || bad) return false;
+    if (!st) {
+        int lo = 0, hi = 0;
+        cudaDeviceGetStreamPriorityRange(&lo, &hi);
+        if (cudaStreamCreateWithPriority(&st, cudaStreamNonBlocking, hi) != cudaSuccess) {
+            cudaGetLastError();
+            st = nullptr;
+            bad = true;
+            return false;
+        }
+    }
+    if (!ef[slot] && (cudaEventCreateWithFlags(&ef[slot], cudaEventDisableTiming) != cudaSuccess ||
+                      cudaEventCreateWithFlags(&ej[slot], cudaEventDisableTiming) != cudaSuccess)) {
+        cudaGetLastError();
+        bad = true;
+        return false;
+    }
+    side = st; fork = ef[slot]; join = ej[slot];
+    return true;
+}
+
 size_t gdnc_workspace_bytes(int n_tokens, int v_heads, int C, int HD) {
     const int n_chunks = (n_tokens + C - 1) / C;
     const size_t n_g = (size_t)n_tokens * v_heads;
     const size_t n_w = (size_t)n_tokens * v_heads * HD;
     const size_t n_m = (size_t)n_chunks * v_heads * C * C;
     return gdnc_align_up(n_g * sizeof(float)) + n_m * sizeof(float)
-         + n_w * sizeof(__nv_bfloat16) + n_w * sizeof(__nv_bfloat16);
+         + n_w * sizeof(__nv_bfloat16) + n_w * sizeof(__nv_bfloat16)
+         + gdnc_align_up((size_t)n_chunks * v_heads * sizeof(int));
 }
 
 // Shared memory for one scan block, matching the arena the kernel carves up (s_C, s_Y and s_Ub
@@ -1295,7 +1364,8 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
                               int n_tokens, int q_heads, int v_heads, int head_dim,
                               bool qh_block, cudaStream_t stream,
                               bool carry_in, int slot, cudaEvent_t prep_done,
-                              const GdnVFold* vfold, bool scan_trigger) {
+                              const GdnVFold* vfold, bool scan_trigger,
+                              bool prep_overlap) {
     constexpr int C = 32, HD = 128, PREP_THREADS = 256;
     // The fold is written for the four-tap conv every GDN checkpoint here has (kGdncVfK).
     const GdnVFold vf = (vfold && vfold->qkv && vfold->conv_w && vfold->conv_kernel == kGdncVfK)
@@ -1457,26 +1527,73 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
         const size_t off_m = gdnc_align_up(n_g * sizeof(float));
         const size_t off_w = off_m + n_m * sizeof(float);
         const size_t off_u = off_w + n_w * sizeof(__nv_bfloat16);
-        const size_t total = off_u + n_w * sizeof(__nv_bfloat16);
+        const size_t off_r = gdnc_align_up(off_u + n_w * sizeof(__nv_bfloat16));
+        const size_t total = off_r + gdnc_align_up((size_t)n_chunks * v_heads * sizeof(int));
         if (!ws_reserve(total, slot)) return false;
         char* base = reinterpret_cast<char*>(g_ws[slot]);
         float* g_buf = reinterpret_cast<float*>(base);
         float* m_buf = reinterpret_cast<float*>(base + off_m);
         auto* w_buf = reinterpret_cast<__nv_bfloat16*>(base + off_w);
         auto* u_buf = reinterpret_cast<__nv_bfloat16*>(base + off_u);
-        dim3 gprep(n_chunks, v_heads);
-        if (vf.qkv)
-            pf_gdnc_prep_kernel<C, HD, true><<<gprep, PREP_THREADS, sm_prep, stream>>>(
-                qb, kb, vb, ab, bb, db, aa, g_buf, w_buf, u_buf, m_buf,
-                len, q_heads, v_heads, qh_block, prep_warp_inv, vf, row0, n_tokens);
-        else
-            pf_gdnc_prep_kernel<C, HD><<<gprep, PREP_THREADS, sm_prep, stream>>>(
-                qb, kb, vb, ab, bb, db, aa, g_buf, w_buf, u_buf, m_buf,
-                len, q_heads, v_heads, qh_block, prep_warp_inv, vf, row0, n_tokens);
-        if (prep_done) {
-            cudaEventRecord(prep_done, stream);
-            prep_done = nullptr;
+        int* ready = reinterpret_cast<int*>(base + off_r);
+        // Overlapped prep + scan. The scan is a chain over chunks on v_heads x HD/NCOL blocks (96 on
+        // this checkpoint) and leaves most of the device idle, while the prep is fully parallel; run
+        // back to back, a GDN layer costs their sum (4096 tokens: 267 + 312 us). Instead the scan is
+        // forked onto a side stream and launched first, then the prep on `stream`: each scan block
+        // waits only for its own head's chunk (the prep's per-(chunk, head) flag, `ready`) and
+        // follows behind the prep, which runs in the room the scan leaves. The prep waits on nothing
+        // but the work before it on `stream`; what has to hold is that it can be placed while the
+        // scan's blocks spin. Blocks of a grid still waiting to be placed are taken ahead of a later
+        // launch, so the whole scan grid must fit at once with an SM to spare: fewer blocks than SMs
+        // (WPC 2 on 48 heads is 192 blocks and hangs without this), and one such grid in flight at a
+        // time (gdnc_side_stream). If the scan's blocks are placed only after the prep, they simply
+        // find every flag set. The join puts `stream` back behind the scan before anything reads
+        // its output.
+        // Only where the caller says the pass is one prompt alone (prep_overlap): a mixed step's
+        // decode rows and a pack's segments keep prep-then-scan, as #1361 keeps z for the same pass.
+        // Not with scan_trigger either: the z GEMM programmatic behind the scan (#1363) starts beside
+        // it only on the same stream, and would wait out the join instead.
+        // Same kernels, same arithmetic: bit-identical. Short passes, where the fork costs more than
+        // the overlap wins, keep prep-then-scan (SPARKINFER_PREFILL_GDN_PREP_OVERLAP_MIN_CHUNKS, 12 =
+        // 384 tokens); SPARKINFER_PREFILL_GDN_PREP_OVERLAP=0 keeps it everywhere.
+        static const bool overlap_on = [] {
+            const char* e = getenv("SPARKINFER_PREFILL_GDN_PREP_OVERLAP");
+            return !(e && e[0] == '0');
+        }();
+        static const int overlap_min_chunks = [] {
+            const char* e = getenv("SPARKINFER_PREFILL_GDN_PREP_OVERLAP_MIN_CHUNKS");
+            return e ? atoi(e) : 12;
+        }();
+        cudaStream_t side = nullptr;
+        cudaEvent_t ev_fork = nullptr, ev_join = nullptr;
+        const int scan_blocks = use_mma ? v_heads * (HD / (mma_wpc * GmLayout<4>::CW)) : 0;
+        bool overlap = prep_overlap && !scan_trigger && overlap_on && use_mma &&
+                       n_chunks >= overlap_min_chunks && sms > 0 && scan_blocks < sms &&
+                       gdnc_side_stream(slot, side, ev_fork, ev_join);
+        if (overlap) {
+            cudaMemsetAsync(ready, 0, (size_t)n_chunks * v_heads * sizeof(int), stream);
+            overlap = cudaEventRecord(ev_fork, stream) == cudaSuccess &&
+                      cudaStreamWaitEvent(side, ev_fork, 0) == cudaSuccess;
         }
+        auto launch_prep = [&](bool flags) {
+            const dim3 gprep = flags ? dim3(v_heads, n_chunks) : dim3(n_chunks, v_heads);
+            if (vf.qkv)
+                pf_gdnc_prep_kernel<C, HD, true><<<gprep, PREP_THREADS, sm_prep, stream>>>(
+                    qb, kb, vb, ab, bb, db, aa, g_buf, w_buf, u_buf, m_buf,
+                    len, q_heads, v_heads, qh_block, prep_warp_inv, vf, row0, n_tokens,
+                    flags ? ready : nullptr);
+            else
+                pf_gdnc_prep_kernel<C, HD><<<gprep, PREP_THREADS, sm_prep, stream>>>(
+                    qb, kb, vb, ab, bb, db, aa, g_buf, w_buf, u_buf, m_buf,
+                    len, q_heads, v_heads, qh_block, prep_warp_inv, vf, row0, n_tokens,
+                    flags ? ready : nullptr);
+            // z's leg (#1361) waits on this, so it follows the prep whichever order it ran in.
+            if (prep_done) {
+                cudaEventRecord(prep_done, stream);
+                prep_done = nullptr;
+            }
+        };
+        if (!overlap) launch_prep(false);
         if (use_mma) {
             auto go = [&](auto wpc_tag) {
                 constexpr int W = decltype(wpc_tag)::value;
@@ -1486,13 +1603,19 @@ bool launch_prefill_gdn_chunk(const void* q, const void* k, const void* v,
                         qb, kb, g_buf, w_buf, u_buf, m_buf, state, ob,
                         len, q_heads, v_heads, n_chunks, qh_block, carry);
                 else
-                    pf_gdnc_scan_mma_kernel<W><<<grid, W * 32, GmLayout<W>::SMEM, stream>>>(
+                    pf_gdnc_scan_mma_kernel<W><<<grid, W * 32, GmLayout<W>::SMEM,
+                                                  overlap ? side : stream>>>(
                         qb, kb, g_buf, w_buf, u_buf, m_buf, state, ob,
-                        len, q_heads, v_heads, n_chunks, qh_block, carry);
+                        len, q_heads, v_heads, n_chunks, qh_block, carry, overlap ? ready : nullptr);
             };
             if (mma_wpc == 2) go(std::integral_constant<int, 2>{});
             else if (mma_wpc == 8) go(std::integral_constant<int, 8>{});
             else go(std::integral_constant<int, 4>{});
+            if (overlap) {
+                launch_prep(true);
+                cudaEventRecord(ev_join, side);
+                cudaStreamWaitEvent(stream, ev_join, 0);
+            }
         } else if (use_regs) {
             pf_gdnc_scan_kernel<C, HD, JC_S, true>
                 <<<dim3(v_heads, HD / JC_S), (C * JC_S) / 4,
