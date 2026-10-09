@@ -70,6 +70,8 @@
 #include <climits>
 #include <limits>
 #include <algorithm>
+#include <initializer_list>
+#include <utility>
 
 namespace sparkinfer {
 
@@ -1974,6 +1976,50 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
     static int pf_win = -1;
     if (pf_win < 0) { const char* e = getenv("SPARKINFER_MG_L2PF_WIN"); pf_win = e ? atoi(e) : 7; }
 
+    // The decode shadow's L2 prefetch (Ternary-Bonsai-2). A single-row step streams ~5 GB of
+    // ternary blocks, but between its GEMVs sit latency-bound stretches -- the GDN conv and scan,
+    // attention, the norms and rotations -- that leave the bus idle. Each window below is forked
+    // onto stream_pf just before such a stretch and bulk-prefetches (TMA, launch_l2_prefetch_bulk)
+    // the leading bytes of the matrices read right after it, so they are served from the 96 MB L2.
+    // Nothing reads what a prefetch fetches -- it only moves where bytes come from, the results are
+    // bit-identical -- so no window is joined until the end of the step: a join per window would
+    // break the programmatic launch chain on the main stream.
+    //   window A  GDN conv + scan       ssm_out whole, the first 8 MB of gate and of up
+    //             attention             o_proj whole, the first 8 MB of gate and of up
+    //   window B  GDN norm + ssm_out    the next 4 MB of gate and of up
+    //   window C  gate/up GEMV          the first 4 MB of down
+    //   window D  down GEMV + tail      the next layer's first 4 MB of in-projection
+    // Swept on a 5090 (decode tok/s @128, all off = 206.7): A alone 211.7, A+C 216.3, A+B+C+D
+    // 216.9, plus attention 220.7. Larger windows measured flat to worse (A at 12/16 MB, C at
+    // 8/12/20 MB, D at 8 MB), as did each row's leading slice instead of a matrix's leading bytes.
+    // SPARKINFER_BONSAI_L2PF=0 disables every window.
+    static const bool kBonsaiL2pf = [] {
+        const char* e = getenv("SPARKINFER_BONSAI_L2PF");
+        return !(e && e[0] == '0');
+    }();
+    constexpr size_t kPfGateUp = 8u << 20, kPfGateUpNext = 4u << 20, kPfDown = 4u << 20,
+                     kPfNextIn = 4u << 20;
+    // A ternary matrix's bytes: 28-byte blocks of 128 weights.
+    auto ptq1_bytes = [](size_t rows, size_t k) { return rows * (k / 128) * 28; };
+    bool bpf_outstanding = false;
+    auto bpf_fork = [&](std::initializer_list<std::pair<const void*, size_t>> ranges) {
+        if (!kBonsaiL2pf || s.stream_pf == nullptr) return;
+        cu(cudaEventRecord(s.ev_pf_fork, st), "bonsai l2 prefetch fork");
+        cu(cudaStreamWaitEvent(s.stream_pf, s.ev_pf_fork, 0), "bonsai l2 prefetch fork wait");
+        for (const auto& r : ranges)
+            if (r.first && r.second) kernels::launch_l2_prefetch_bulk(r.first, r.second, s.stream_pf);
+        bpf_outstanding = true;
+    };
+    // Window A's and the attention window's gate/up share: both matrices' leading kPfGateUp bytes.
+    auto bpf_gate_up = [&](const Qwen35LayerWeights& lw, const void* first, size_t first_b) {
+        if (lw.gate_qtype != kPtq1GgmlType || lw.up_qtype != kPtq1GgmlType) {
+            bpf_fork({{first, first_b}});
+            return;
+        }
+        const size_t gu = std::min(ptq1_bytes(c.moe_ffn, H), kPfGateUp);
+        bpf_fork({{first, first_b}, {lw.gate_q, gu}, {lw.up_q, gu}});
+    };
+
     // The decode shadow's xn, rotated and quantized into bonsai_ffn_q by the norm that wrote it
     // (the previous layer's tail, launch_ptq1_add_norm_rotq_bf16), so its first reader -- the next
     // layer's projections or the head -- skips its own rotq. Cleared by that reader.
@@ -2244,6 +2290,9 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                         (int)s.linear_qkvdim, (int)H, st, s.bonsai_part, s.bonsai_part_slot);
                 if (!qkv_splits)
                     gemv8(w.wqkv, nullptr, s.lin_qkv, nullptr, (int)s.linear_qkvdim, (int)H, st, 0);
+                // Window A: the conv and the scan ahead read no weights.
+                if (w.ssm_out_type == kPtq1GgmlType)
+                    bpf_gate_up(w, w.ssm_out, ptq1_bytes(H, s.linear_vdim));
             } else if (gdn_quad) {
                 kernels::launch_gdn_quad_mmvq_q4k(s.aq81, w.wqkv, w.wqkv_gate, w.ssm_alpha, w.ssm_beta,
                     s.lin_qkv, s.lin_z, s.lin_alpha, s.lin_beta,
@@ -2338,6 +2387,14 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                                s.bonsai_ffn_qd, s.bonsai_ffn_qs, 1, (int)s.linear_vdim,
                                c.linear_head_dim, (int)s.bonsai_block, st)) {
                 gemv_t(w.ssm_out, s.ao, (int)H, (int)s.linear_vdim);
+                // Window B: the post-attention norm and its rotation, then gate/up.
+                if (w.gate_qtype == kPtq1GgmlType && w.up_qtype == kPtq1GgmlType) {
+                    const size_t gu = ptq1_bytes(c.moe_ffn, H);
+                    const size_t off = std::min(gu, kPfGateUp);
+                    const size_t n = std::min(gu - off, kPfGateUpNext);
+                    bpf_fork({{static_cast<const char*>(w.gate_q) + off, n},
+                              {static_cast<const char*>(w.up_q) + off, n}});
+                }
             } else if (gdn_gn_q8) {
                 static int gn_q8 = -1;
                 if (gn_q8 < 0) {
@@ -2469,6 +2526,10 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
             const bool qkgate_fuse = w.q_has_gate && partial_rope && kv8 && s.use_qkfuse && qk_fuse_h;
             // w.wgate != nullptr means Q and the gate were projected straight into s.q / s.qgate
             // above, so there is no interleaved s.qraw to split.
+            // The decode shadow's window A for an attention layer: QK-norm, RoPE and the
+            // attention itself read no weights, and o_proj then gate/up are next.
+            if (dec_shadow && w.wo_type == kPtq1GgmlType)
+                bpf_gate_up(w, w.wo, ptq1_bytes(H, s.qdim));
             if (w.q_has_gate && !qkgate_fuse && !w.wgate)
                 kernels::launch_qwen36_split_q_gate(s.qraw, s.q, s.qgate, c.n_q_heads, c.head_dim, st);
             dbg_bf16(s.q, s.qdim, 11, L);      // tag 11: Q, raw split, pre QK-norm
@@ -2936,6 +2997,8 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                     kernels::launch_gemv_ptq1_q2(hq, s.bonsai_rot_hn, w.gate_q, w.up_q,
                                                  s.bonsai_ffn_gate, s.bonsai_ffn_up, c.moe_ffn, H,
                                                  st);
+                    // Window C: down's leading bytes, behind gate/up and the SwiGLU rotation.
+                    bpf_fork({{w.down_q, std::min(ptq1_bytes(H, c.moe_ffn), kPfDown)}});
                 } else {
                     kernels::launch_hadamard_rotate_bf16(s.hn, s.bonsai_rot_hn, s.bonsai_sign_h,
                                                          H, (int)H, (int)s.bonsai_block, st);
@@ -2960,6 +3023,20 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
                         (int)s.bonsai_block, st);
                     kernels::launch_gemv_ptq1_q(fq, s.bonsai_ffn_h, w.down_q, s.routed, H,
                                                 c.moe_ffn, st);
+                    // Window D: the layer tail and the next layer's rotation, then its
+                    // in-projection (qkv and z, or [q|gate]).
+                    if (L + 1 < c.n_layers) {
+                        const Qwen35LayerWeights& nw = s.bonsai_dec_layers[L + 1];
+                        if (nw.linear_attn && nw.wqkv_type == kPtq1GgmlType &&
+                            nw.wqkv_gate_type == kPtq1GgmlType)
+                            bpf_fork({{nw.wqkv, std::min(ptq1_bytes(s.linear_qkvdim, H), kPfNextIn)},
+                                      {nw.wqkv_gate,
+                                       std::min(ptq1_bytes(s.linear_vdim, H), kPfNextIn / 2)}});
+                        else if (!nw.linear_attn && nw.wq_type == kPtq1GgmlType)
+                            bpf_fork({{nw.wq, std::min(ptq1_bytes((nw.q_has_gate && !nw.wgate
+                                                                     ? 2 : 1) * s.qdim, H),
+                                                       kPfNextIn)}});
+                    }
                 } else {
                     kernels::launch_hadamard_rotate_bf16(s.bonsai_ffn_h, s.bonsai_ffn_h,
                                                          s.bonsai_sign_ffn, c.moe_ffn,
@@ -3203,6 +3280,10 @@ int Qwen35Model::forward_token(int token_id, int position, bool sample, float te
         dflash_maybe_capture_layer(L);
     }
     pf_join();   // last layer's prefetch: must be joined before the capture ends or the graph is malformed
+    if (bpf_outstanding) {   // the decode shadow's windows: one join, here, for the same reason
+        cu(cudaEventRecord(s.ev_pf_done, s.stream_pf), "bonsai l2 prefetch done");
+        cu(cudaStreamWaitEvent(st, s.ev_pf_done, 0), "bonsai l2 prefetch join");
+    }
     // xn now holds RMSNorm(x_final, final_norm)
     dbg_bf16(s.xn, H, 80, -2);   // tag 80: final-norm output (lm_head input)
     dbg_xn_snapshot(s.xn, c.n_layers);   // extra slot: final-norm output, for lm_head cross-check
@@ -10252,6 +10333,13 @@ bool Qwen35Model::load_gguf(const std::string& path) {
     }
     if (bonsai_shadow && !shadow_of.empty()) {
         s.bonsai_dec_layers = s.w.layers;
+        // The decode shadow's L2 prefetch windows (forward_token) run on the prefetch stream,
+        // which otherwise exists only for Muse Glimmer.
+        if (!s.stream_pf) {
+            cudaStreamCreateWithFlags(&s.stream_pf, cudaStreamNonBlocking);
+            cudaEventCreateWithFlags(&s.ev_pf_fork, cudaEventDisableTiming);
+            cudaEventCreateWithFlags(&s.ev_pf_done, cudaEventDisableTiming);
+        }
         int n_proj = 0, n_ffn = 0;
         auto swap_in = [&](const void*& ptr, int& type) {
             const auto it = shadow_of.find(ptr);
