@@ -31,6 +31,16 @@ constexpr int kBlkBytes = 28;
 constexpr int kSpan = 1024;        // Hadamard span of this checkpoint
 constexpr float kWScale = 1024.f;  // the weight scale's lift into ue4m3's normal range
 
+// Programmatic dependent launch. At 128 rows a GEMM's CTAs started ~4 us after the rotation ahead
+// of it ended, then spent ~2.5 us on their first weight stage: about a fifth of every short GEMM.
+// Launched programmatic, a kernel's CTAs come up while the one ahead is still running, and wait
+// in pdl_wait() before their first read of anything that kernel writes (or write of anything it
+// reads). Without the launch attribute griddepcontrol.wait returns at once.
+__device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
+__device__ __forceinline__ void pdl_trigger() {
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+}
+
 // A PTQ1_0 block stores its 128 trits base-3, five to a byte in bytes 0..23 and four in bytes 24
 // and 25 (fp16 scale in 26..27); digit m of a byte is floor(3 * x_m / 256), x_{m+1} = 3 * x_m mod
 // 256. In the block's natural order byte b's digit m is value 16m + b (b < 16), 80 + 8m + (b - 16)
@@ -57,6 +67,8 @@ ptq1_rotq_fp4_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* _
                      const signed char* __restrict__ sign, unsigned char* __restrict__ q,
                      int rows, int k) {
     __shared__ float sh[kSpan];
+    pdl_trigger();   // the GEMM after it may come up and decode weights
+    pdl_wait();      // x comes from the kernel ahead, and q may still be read by the GEMM before
     const int t = threadIdx.x, lane = t & 31;
     const int row = blockIdx.x;
     unsigned char* qrow = q + (size_t)row * (k / 2);
@@ -376,6 +388,9 @@ ptq1_fp4_gemm_kernel(const unsigned char* __restrict__ a, int M, int K, Legs L,
     auto fullB  = [&](int s) { return mb0 + 8u * (unsigned)(2 * NS + s); };
     auto emptyB = [&](int s) { return mb0 + 8u * (unsigned)(3 * NS + s); };
     const int tid = threadIdx.x;
+    // The kernel after it (the split-K reduce, the next rotation) waits for this whole grid
+    // anyway; it may take the SMs this grid leaves free.
+    pdl_trigger();
     for (int e = tid; e < kLutN; e += THREADS) sm.lut[e] = fp4_lut_entry(e >> 8, e & 0xFF);
     if (tid == 0) {
         for (int s = 0; s < NS; s++) {
@@ -405,6 +420,7 @@ ptq1_fp4_gemm_kernel(const unsigned char* __restrict__ a, int M, int K, Legs L,
         const int lane = tid - (N_MMA + N_DEC);
         const size_t arow = (size_t)K / 2, asrow = (size_t)K / 16;
         const unsigned char* asf_g = a + (size_t)M * arow;
+        pdl_wait();
         int g = 0;
         for (int w = blockIdx.x; w < nitems; w += gridDim.x) {
             int mt, leg, n0, kb0, nst;
@@ -457,6 +473,9 @@ ptq1_fp4_gemm_kernel(const unsigned char* __restrict__ a, int M, int K, Legs L,
             }
             mb_cp_arrive(fullA(s));
         };
+        // The first pair of B stages is decoded before pdl_wait() (weights only), and its A stages
+        // loaded after it; every later pair loads A first, as before.
+        bool a_ok = !FOLD;
         int g = 0;
         for (int w = blockIdx.x; w < nitems; w += gridDim.x) {
             int mt, leg, n0, kb0, nst;
@@ -484,12 +503,18 @@ ptq1_fp4_gemm_kernel(const unsigned char* __restrict__ a, int M, int K, Legs L,
                 const int s0 = g % NS, s1 = (g + 1) % NS;
                 if (g >= NS) mb_wait(emptyB(s0), ((g / NS) - 1) & 1);
                 if (two && g + 1 >= NS) mb_wait(emptyB(s1), (((g + 1) / NS) - 1) & 1);
-                if constexpr (FOLD) {
+                if (FOLD && a_ok) {
                     load_a(s0, kb0 + i, m0);
                     if (two) load_a(s1, kb0 + i + 1, m0);
                 }
                 decode_half(tw[0], h, br, sm.lut, sm.b[s0], &sm.bsf[s0][br]);
                 if (two) decode_half(tw[1], h, br, sm.lut, sm.b[s1], &sm.bsf[s1][br]);
+                if (FOLD && !a_ok) {
+                    pdl_wait();
+                    a_ok = true;
+                    load_a(s0, kb0 + i, m0);
+                    if (two) load_a(s1, kb0 + i + 1, m0);
+                }
                 mb_arrive(fullB(s0));
                 if (two) mb_arrive(fullB(s1));
                 g += two ? 2 : 1;
@@ -503,6 +528,7 @@ ptq1_fp4_gemm_kernel(const unsigned char* __restrict__ a, int M, int K, Legs L,
     // ---------------- MMA warps ----------------
     const int warp = tid >> 5, lane = tid & 31;
     const int wm = warp & 1, wn = warp >> 1;
+    pdl_wait();   // the epilogue reads (resid) and writes C or the partials
     int g = 0;
     for (int w = blockIdx.x; w < nitems; w += gridDim.x) {
         int mt, leg, n0, kb0, nst;
@@ -533,6 +559,8 @@ ptq1_fp4_gemm_kernel(const unsigned char* __restrict__ a, int M, int K, Legs L,
 template <bool RESID>
 __global__ void ptq1_fp4_reduce_kernel(const float4* __restrict__ p, __nv_bfloat16* __restrict__ c,
                                        size_t n4, int splits, float alpha) {
+    pdl_trigger();   // the next leg's reduce
+    pdl_wait();
     for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < n4;
          i += (size_t)gridDim.x * blockDim.x) {
         float4 s = p[i];
@@ -559,6 +587,40 @@ int sm_count() {
         return v > 0 ? v : 1;
     }();
     return n;
+}
+
+// Programmatic launches only below the SM count (the 128-row prompt), where a GEMM is short enough
+// for its start-up to matter. Packed prompts (256 rows and up) keep plain launches: they prefill
+// beside the packed decode, and a GEMM CTA that comes up early holds a whole SM the decode could
+// have used. SPARKINFER_PTQ1_FP4_PDL=0 turns it off, =<rows> moves the limit.
+bool pdl_for(int rows) {
+    static const int max_rows = [] {
+        const char* e = getenv("SPARKINFER_PTQ1_FP4_PDL");
+        return e ? atoi(e) : -1;
+    }();
+    return max_rows < 0 ? rows < sm_count() : rows <= max_rows;
+}
+
+template <typename... P, typename... A>
+void launch_k(void (*k)(P...), dim3 grid, int threads, size_t smem, cudaStream_t st, bool pdl,
+              A... args) {
+    // Only inside a graph capture. Programmatic launches made eagerly (the first sighting of a
+    // prompt length, before its graph exists) left the process's decode about 1.4% slower for
+    // its whole life; the graph replays, which carry the gain, did not.
+    cudaStreamCaptureStatus cs = cudaStreamCaptureStatusNone;
+    if (pdl && (cudaStreamIsCapturing(st, &cs) != cudaSuccess || cs != cudaStreamCaptureStatusActive))
+        pdl = false;
+    cudaLaunchAttribute la{};
+    la.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    la.val.programmaticStreamSerializationAllowed = 1;
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = grid;
+    cfg.blockDim = dim3(threads);
+    cfg.dynamicSmemBytes = smem;
+    cfg.stream = st;
+    cfg.attrs = &la;
+    cfg.numAttrs = pdl ? 1 : 0;
+    cudaLaunchKernelEx(&cfg, k, static_cast<P>(args)...);
 }
 
 // Split K only while the persistent grid would leave SMs short: pick the slice count whose last
@@ -616,11 +678,11 @@ bool launch_ptq1_rotq_fp4(const void* x_bf16, const void* up_bf16, const signed 
     const dim3 grid(rows, span_grid && rows < sm_count() ? k / kSpan : 1);
     const auto* x = static_cast<const __nv_bfloat16*>(x_bf16);
     auto* q = static_cast<unsigned char*>(a);
+    const auto* u = static_cast<const __nv_bfloat16*>(up_bf16);
     if (up_bf16)
-        ptq1_rotq_fp4_kernel<true><<<grid, 256, 0, st>>>(
-            x, static_cast<const __nv_bfloat16*>(up_bf16), sign, q, rows, k);
+        launch_k(ptq1_rotq_fp4_kernel<true>, grid, 256, 0, st, pdl_for(rows), x, u, sign, q, rows, k);
     else
-        ptq1_rotq_fp4_kernel<false><<<grid, 256, 0, st>>>(x, nullptr, sign, q, rows, k);
+        launch_k(ptq1_rotq_fp4_kernel<false>, grid, 256, 0, st, pdl_for(rows), x, u, sign, q, rows, k);
     return cudaPeekAtLastError() == cudaSuccess;
 }
 
@@ -671,9 +733,10 @@ bool launch_ptq1_fp4_gemm(const void* a, int m, int k, const void* const* w, voi
     const auto* A = static_cast<const unsigned char*>(a);
     float* P = splits > 1 ? part : nullptr;
     const bool rk = resid && !P;
+    const bool pdl = pdl_for(m);
 #define PTQ1_FP4_GO(R_, F_)                                                                   \
-    ptq1_fp4_gemm_kernel<R_, F_><<<grid, Ring<F_>::THREADS, F_ ? smem_f : smem_s, st>>>(      \
-        A, m, k, L, P, per, mtiles, tiles_n, nitems, alpha)
+    launch_k(ptq1_fp4_gemm_kernel<R_, F_>, dim3(grid), Ring<F_>::THREADS, F_ ? smem_f : smem_s, \
+             st, pdl, A, m, k, L, P, per, mtiles, tiles_n, nitems, alpha)
     if (fold) { if (rk) PTQ1_FP4_GO(true, true);  else PTQ1_FP4_GO(false, true);  }
     else      { if (rk) PTQ1_FP4_GO(true, false); else PTQ1_FP4_GO(false, false); }
 #undef PTQ1_FP4_GO
@@ -683,9 +746,11 @@ bool launch_ptq1_fp4_gemm(const void* a, int m, int k, const void* const* w, voi
             const int blocks = (int)((n4 + 255) / 256 < 4096 ? (n4 + 255) / 256 : 4096);
             const auto* p4 = reinterpret_cast<const float4*>(part + L.poff[i]);
             if (resid)
-                ptq1_fp4_reduce_kernel<true><<<blocks, 256, 0, st>>>(p4, L.c[i], n4, splits, alpha);
+                launch_k(ptq1_fp4_reduce_kernel<true>, dim3(blocks), 256, 0, st, pdl, p4, L.c[i],
+                         n4, splits, alpha);
             else
-                ptq1_fp4_reduce_kernel<false><<<blocks, 256, 0, st>>>(p4, L.c[i], n4, splits, alpha);
+                launch_k(ptq1_fp4_reduce_kernel<false>, dim3(blocks), 256, 0, st, pdl, p4, L.c[i],
+                         n4, splits, alpha);
         }
     }
     return cudaPeekAtLastError() == cudaSuccess;
