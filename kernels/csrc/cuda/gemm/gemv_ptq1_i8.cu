@@ -859,9 +859,10 @@ __global__ void ptq1_split_reduce_kernel(const float* __restrict__ part, OutT* _
 // Launches a packed-row kernel programmatic (see pdl_trigger) when `pdl`; SPARKINFER_ROWS_PDL=0
 // launches every one the ordinary way, for an A/B out of one binary.
 //
-// Only the 8-token tile takes it. There a launch is mostly its weight stream and its fixed start
-// cost, which the early weight fetch hides (c2 +3.8%). Past 8 rows the kernel holds 46-65 KB of
-// shared memory per CTA, and CTAs parked on the wait crowd the side stream's kernels: c16 -1.6%.
+// The 8- and 32-token tiles take it (rows_pdl). At 8 tokens a launch is mostly its weight stream
+// and its fixed start cost, which the early weight fetch hides (c2 +3.8%). The 16-token tile does
+// not: its CTAs (46-65 KB of shared memory) parked on the wait crowd the side stream's kernels,
+// c16 -1.6%. At 32 tokens the first stage's 1.5 us wait outweighs that (c32 +1.8% GPU time).
 template <typename... KArgs, typename... Args>
 void launch_rows_pdl(bool pdl, void (*kernel)(KArgs...), dim3 grid, dim3 block, size_t shm,
                      cudaStream_t st, Args... args) {
@@ -915,6 +916,9 @@ unsigned* split_cnt_for(cudaStream_t st, int tiles) {
     return base + (size_t)(used++) * kCntTiles;
 }
 
+// Which tile widths launch programmatic; see launch_rows_pdl.
+constexpr bool rows_pdl(int nt) { return nt != 2; }
+
 template <int NT, int ST, typename OutT, bool SPLIT, int WARPS = 8>
 void launch_mma_rows_t(const signed char* xq, const float* xd, const int* xs, const void* w0,
                        const void* w1, OutT* y0, OutT* y1, int m, int n_rows, int nblk, int S,
@@ -934,7 +938,7 @@ void launch_mma_rows_t(const signed char* xq, const float* xd, const int* xs, co
     // GEMM ends and costs next to nothing, and the last CTA's pass would only lengthen the tail
     // (single-row decode 1% slower).
     unsigned* cnt = SPLIT && WARPS == 8 && NT > 1 ? split_cnt_for(st, ctas * nmat) : nullptr;
-    launch_rows_pdl(NT == 1, ptq1_mma_rows_kernel<NT, WARPS, KB, ST, OutT, SPLIT>,
+    launch_rows_pdl(rows_pdl(NT), ptq1_mma_rows_kernel<NT, WARPS, KB, ST, OutT, SPLIT>,
                     dim3(ctas * nmat, SPLIT ? S : 1), dim3(WARPS * 32), shm, st, xq, xd, xs,
                     static_cast<const unsigned char*>(w0), static_cast<const unsigned char*>(w1),
                     y0, y1, m, n_rows, nblk, ctas, part, sps, cnt);
