@@ -484,7 +484,9 @@ ptq1_fp4_gemm_kernel(const unsigned char* __restrict__ a, int M, int K, Legs L,
             const unsigned* wrow = reinterpret_cast<const unsigned*>(
                 L.w[leg] + (size_t)(n0 + br) * nblk * kBlkBytes + (size_t)kb0 * kBlkBytes);
             // Two stages an iteration (independent decode chains), their words (2h, 2h+1, 4+h and 6
-            // of the block) a pair ahead.
+            // of the block) a pair ahead. The first stage is handed to the MMA warps as soon as it
+            // is decoded and the second slot claimed only then: claiming both slots up front and
+            // releasing both at the end left the MMA warps one ready stage at NS = 3.
             unsigned tw[2][4], nx[2][4];
             auto fetch = [&](int i, unsigned (&t)[4]) {
                 if (i >= nst) return;
@@ -502,20 +504,19 @@ ptq1_fp4_gemm_kernel(const unsigned char* __restrict__ a, int M, int K, Legs L,
                 const bool two = i + 1 < nst;
                 const int s0 = g % NS, s1 = (g + 1) % NS;
                 if (g >= NS) mb_wait(emptyB(s0), ((g / NS) - 1) & 1);
-                if (two && g + 1 >= NS) mb_wait(emptyB(s1), (((g + 1) / NS) - 1) & 1);
-                if (FOLD && a_ok) {
-                    load_a(s0, kb0 + i, m0);
-                    if (two) load_a(s1, kb0 + i + 1, m0);
-                }
+                if (FOLD && a_ok) load_a(s0, kb0 + i, m0);
                 decode_half(tw[0], h, br, sm.lut, sm.b[s0], &sm.bsf[s0][br]);
+                if (a_ok) mb_arrive(fullB(s0));
+                if (two && g + 1 >= NS) mb_wait(emptyB(s1), (((g + 1) / NS) - 1) & 1);
+                if (two && FOLD && a_ok) load_a(s1, kb0 + i + 1, m0);
                 if (two) decode_half(tw[1], h, br, sm.lut, sm.b[s1], &sm.bsf[s1][br]);
                 if (FOLD && !a_ok) {
                     pdl_wait();
                     a_ok = true;
                     load_a(s0, kb0 + i, m0);
                     if (two) load_a(s1, kb0 + i + 1, m0);
+                    mb_arrive(fullB(s0));
                 }
-                mb_arrive(fullB(s0));
                 if (two) mb_arrive(fullB(s1));
                 g += two ? 2 : 1;
 #pragma unroll
