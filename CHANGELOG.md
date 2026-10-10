@@ -5,6 +5,70 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+## [0.6.33] — 2026-10-10
+
+**Swift-Qwen3.8-27B runs out of the box and leads vLLM in every serving cell; 20 contributor
+speedups, each verified on the RTX 5090 against the main of its round: Ternary-Bonsai short-prompt
+prefill +14.9% and 32-request decode +10%, Muse Glimmer 32-request decode +14.7%.**
+
+### Performance
+
+Each figure is the bot-verified gain of that PR over the `main` it was measured against (same box,
+same session), on the axis its label came from; gains measured in different rounds do not add.
+
+Ternary-Bonsai-2-27B:
+
+- The short-prompt FP4 GEMM loads its A stages from the decoded operand (#1226, @carlo171112):
+  prefill@128 **+14.9%**.
+- A wide burst of requests waits for its last arrival before the first prefill (#1331, @kaivaryn;
+  runtime, every model): 32-request decode **+10.0%**.
+- The kept NVFP4 legs take the 128x128 tile where BigM's grid leaves its last wave short (#1357,
+  @DripMicro): prefill@512 **+9.8%**.
+- The packed step keeps each row's GDN state as int8 columns (#1334, @kaivaryn): 32-request decode
+  +6.7%.
+- Batched prefill keeps the ternary legs' NVFP4 copy between passes (#1339, @ms911112):
+  prefill@512 +6.5%.
+- The long prompt's norms and attention gate run inside the FP4 rotations (#1353, @FranDev132):
+  prefill +3.4-3.9% at 512-32K tokens.
+- The short-prompt FP4 rotate+quantize runs a CTA per 1024 (#1219, @ms911112): prefill@128 +4.5%.
+- The long-prompt FP4 activation rounds to e2m1 in fp32 (#1332, @ms911112): prefill@4k +3.8%.
+- The decode glue kernels fetch the checkpoint's operands before their programmatic wait (#1360,
+  @inference2026): single-request decode +3.2-3.8% at every context.
+- Packed decode on the int8 KV of a 6:1 hd256 group takes the tensor-core split (#1335, @ms911112):
+  32-request decode +3.2%.
+- The long prompt's z projection runs beside the GDN scan (#1361, @FranDev132): prefill +1.5-3.0%.
+- The GDN conv's v channels come from the chunked scan's prep (#1363, @FranDev132): prefill
+  +1.6-2.6%.
+
+Muse Glimmer 30B:
+
+- Packed decode on the int8 KV splits each row's attention by the row count (#1333, @kaivaryn):
+  32-request decode **+14.7%**.
+- The FFN chunk is sized against the VRAM a pass would add (#1340, @ms911112): prefill@4k +6.7%.
+- Packed decode pulls the head of each layer's gate/up weights into L2 with TMA prefetches (#1352,
+  @FranDev132): 4-request decode +4.5%.
+- Gate and up are one row-interleaved NVFP4 GEMM (#1345, @FranDev132): 4-request decode +4.3%.
+- Packed decode's GEMMs launch programmatic and prefetch their first weight tiles (#1348,
+  @FranDev132): 4-request decode +3.5%.
+- The sandwich norm on a bf16 branch runs with the next pre-norm and its FP4 quantize (#1342,
+  @FranDev132): prefill@128 +2.5%.
+- The NVFP4 up projection runs SwiGLU and the down projection's FP4 quantize in its epilogue (#1344,
+  @kaivaryn; Qwen3.8 too): prefill@4k +2.1%.
+
+Qwen3.8-27B:
+
+- A packed decode step that cannot get its scratch takes back what batched prefill keeps (#1359,
+  @FranDev132): 32-request decode +4.6%.
+
+### Added
+
+- **Swift-Qwen3.8-27B-NVFP4-RTX5090 is supported and benchmarked** (README, "Fine-tunes"). It
+  serves at base Qwen3.8's speed and leads vLLM 0.30.0 in every cell: chat 327 / 971 / 1,320 vs
+  271 / 862 / 1,239 tok/s at 4 / 16 / 32 requests, and time to first token on a 120K-token prompt
+  14.6 vs 22.3 s.
+- **`cells.sh` takes `VL_EXTRA`**: extra `vllm serve` arguments, e.g. `--kv-cache-dtype fp8` for a
+  checkpoint whose KV scheme vLLM cannot read.
+
 ### Fixed
 
 - **Qwen3.8's reasoning effort follows its chat template.** Both Qwen3.8 templates give xhigh (the
@@ -23,6 +87,12 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
   it to every encode, so a file saved with truncation on cut every prompt without an error --
   gittensor-model-hub/Swift-Qwen3.8-27B-NVFP4-RTX5090 ships `max_length: 512`, and a 30 KB prompt
   encoded to 512 tokens. The server now nulls both blocks at load and logs a warning.
+
+### Eval
+
+- **A merged PR keeps its merge-first label** (#1367). The label records the round's winner; every
+  bot used to strip it right after the merge. The sync now remembers handled merges in
+  `~/.sparkinfer_merge_first_seen.json`, so a merge still nudges its rivals to rebase exactly once.
 
 ## [0.6.32] — 2026-10-06
 

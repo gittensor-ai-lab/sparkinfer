@@ -13,12 +13,13 @@
 # (AIPerf counts the streamed text, so hidden reasoning would read as missing output.)
 #
 # More environment: WHICH ("sparkinfer vllm"), ONLYCHAT / ONLY8K, DECODE_ONLY (32 -> 256 tokens at
-# 16 / 32, pure decode), SI_EXTRA (extra server args, e.g. "--draft-model DIR"), CTX (32768).
+# 16 / 32, pure decode), SI_EXTRA (extra server args, e.g. "--draft-model DIR"), VL_EXTRA (extra
+# vllm serve args, e.g. "--kv-cache-dtype fp8"), CTX (32768).
 # See common.sh for binaries and paths.
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 : "${SI_M:?SI_M: the model sparkinfer serves}"; VL_M=${VL_M:-$SI_M}; TOK=${TOK:-$SI_M}
 [ -d "$TOK" ] || { echo "TOK must be a directory with tokenizer.json"; exit 2; }
-CTX=${CTX:-32768}; WHICH=${WHICH:-"sparkinfer vllm"}
+CTX=${CTX:-32768}; WHICH=${WHICH:-"sparkinfer vllm"}; VL_EXTRA=${VL_EXTRA:-}
 OUT=$OUT_ROOT/cells_$(date +%m%d_%H%M); mkdir -p "$OUT"
 take_lock
 
@@ -40,7 +41,8 @@ if [[ $WHICH == *sparkinfer* ]]; then
     stop_server "$SP"
 fi
 if [[ $WHICH == *vllm* ]]; then
-    start_vllm "$VL_M" "$CTX" "$OUT/vllm_srv.log" --gpu-memory-utilization 0.92 --max-num-seqs 64 &&
+    # shellcheck disable=SC2086
+    start_vllm "$VL_M" "$CTX" "$OUT/vllm_srv.log" --gpu-memory-utilization 0.92 --max-num-seqs 64 $VL_EXTRA &&
         run_load vllm "$VL_PORT"
     stop_server "$VP"
 fi
