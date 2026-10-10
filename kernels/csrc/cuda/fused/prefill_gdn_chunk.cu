@@ -99,6 +99,44 @@ __device__ __forceinline__ float gc_conv_tap(const __nv_bfloat16* __restrict__ q
 // Shared-memory row padding (in elements) to break the power-of-two bank stride.
 constexpr int PAD = 8;
 
+// W^ and U0 of pf_gdnc_prep_kernel for one thread's IPT rows (i = i0 + si*ISTR): acc0 = T . (coef0_m
+// x0_m[d]) and acc1 = T . (coef1_m x1_m[d]) over the lower triangle m <= i, each row's terms added in
+// ascending m. T's row is read four entries at a time -- one broadcast float4 serving both
+// products, not a scalar load per term per product; a quad past the row's last live m is not
+// loaded and the m > i entries of a loaded quad are not used, so every accumulator is the same
+// chain of FMAs, in the same order, as one term at a time.
+template <int C, int HD, int IPT, int ISTR, int PADV>
+__device__ __forceinline__ void gdnc_tri_apply(const float* __restrict__ sA,
+                                                const float* __restrict__ coef0,
+                                                const __nv_bfloat16* __restrict__ x0,
+                                                const float* __restrict__ coef1,
+                                                const __nv_bfloat16* __restrict__ x1, int d, int i0,
+                                                float (&acc0)[IPT], float (&acc1)[IPT]) {
+    #pragma unroll
+    for (int q = 0; q < C / 4; q++) {
+        float b0[4], b1[4];
+        #pragma unroll
+        for (int r = 0; r < 4; r++) {
+            const int m = 4 * q + r;
+            b0[r] = coef0[m] * gc_to_f(x0[m * (HD + PADV) + d]);
+            b1[r] = coef1[m] * gc_to_f(x1[m * (HD + PADV) + d]);
+        }
+        #pragma unroll
+        for (int si = 0; si < IPT; si++) {
+            if (4 * q > ISTR * si + (ISTR - 1)) continue;
+            const int i = i0 + si * ISTR;
+            const float4 a4 = *reinterpret_cast<const float4*>(sA + i * (C + PADV) + 4 * q);
+            const float av[4] = {a4.x, a4.y, a4.z, a4.w};
+            #pragma unroll
+            for (int r = 0; r < 4; r++) {
+                const int m = 4 * q + r;
+                const bool live = m <= ISTR * si || (m < ISTR * (si + 1) && m - ISTR * si <= i0);
+                if (live) { acc0[si] += av[r] * b0[r]; acc1[si] += av[r] * b1[r]; }
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Kernel 1: per-chunk prep. grid = (n_chunks, v_heads), fully parallel.
 //
@@ -159,15 +197,8 @@ __global__ void pf_gdnc_prep_kernel(const __nv_bfloat16* __restrict__ q,
             s_b[i] = 0.f;
         }
     }
-    __syncthreads();
-    if (tid == 0) {                                  // C=64 serial adds, once per block
-        float acc = 0.f;
-        for (int i = 0; i < C; i++) { acc += s_t[i]; s_g[i] = acc; }
-    }
-    __syncthreads();
-    for (int i = tid; i < len; i += nthr) g_buf[(size_t)(t0 + i) * v_heads + h] = s_g[i];
-
-    // ---- stage K and Q, 8 values (16 B) a load: the rows are contiguous in d and every base is
+    // ---- stage K and Q (in flight beside the gate loads; the two barriers below publish them),
+    // 8 values (16 B) a load: the rows are contiguous in d and every base is
     // 16-byte aligned (HD, q_dim and the HD+PAD smem stride are multiples of 8). Same bytes. ----
     static_assert(HD % 8 == 0 && (HD + PAD) % 8 == 0, "16-byte staging");
     for (int e8 = tid; e8 < (C * HD) / 8; e8 += nthr) {
@@ -181,6 +212,12 @@ __global__ void pf_gdnc_prep_kernel(const __nv_bfloat16* __restrict__ q,
         *reinterpret_cast<uint4*>(s_x + i * (HD + PAD) + d) = qv;
     }
     __syncthreads();
+    if (tid == 0) {                                  // C=64 serial adds, once per block
+        float acc = 0.f;
+        for (int i = 0; i < C; i++) { acc += s_t[i]; s_g[i] = acc; }
+    }
+    __syncthreads();
+    for (int i = tid; i < len; i += nthr) g_buf[(size_t)(t0 + i) * v_heads + h] = s_g[i];
 
     // ---- A[i][j] = b_i (k_i.k_j) exp(G_i-G_j) for j<i (unit diagonal), and M = tril(Q K^T . decay) ----
     // K K^T and Q K^T are 80% of this kernel's MACs and both contract over HD against the same
@@ -277,23 +314,28 @@ __global__ void pf_gdnc_prep_kernel(const __nv_bfloat16* __restrict__ q,
     if constexpr (C == 32) if (warp_inv) {
         if (tid < C) {
             const int j = tid;
-            float tcol[C];                       // tcol[m] == T[m][j]
+            // Column sweep: acc[i] is row i's running sum, and the moment row k has all its terms
+            // T[k][j] = -acc[k] is final, so every later row takes its term k at once. Each row
+            // still adds A[i][j], then A[i][m] T[m][j] for m = j+1 .. i-1 in ascending order (the
+            // same FMAs as row by row), but the chain from one T entry to the next is one FMA
+            // instead of a whole row's sum, and the rows' FMAs issue side by side.
+            float acc[C];
             #pragma unroll
-            for (int m = 0; m < C; m++) tcol[m] = 0.f;
-            tcol[j] = 1.f;                       // unit diagonal
+            for (int i = 0; i < C; i++) acc[i] = s_A[i * (C + PAD) + j];
             #pragma unroll
-            for (int i = 1; i < C; i++) {
-                // Warp-uniform address: all C lanes read the same s_A element, which the shared
-                // memory unit serves as a broadcast, not a C-way conflict.
-                float acc = s_A[i * (C + PAD) + j];
-                #pragma unroll
-                for (int m = 0; m < C; m++)
-                    if (m > j && m < i) acc += s_A[i * (C + PAD) + m] * tcol[m];
-                tcol[i] = -acc;                  // only lanes j < i publish below
+            for (int k = 1; k < C - 1; k++) {
+                if (k > j) {
+                    const float tk = -acc[k];
+                    // Warp-uniform address: a broadcast, not a C-way conflict.
+                    #pragma unroll
+                    for (int i = k + 1; i < C; i++) acc[i] += s_A[i * (C + PAD) + k] * tk;
+                }
             }
+            // Every lane's reads of A are done before any lane overwrites its column with T.
+            __syncwarp();
             #pragma unroll
             for (int i = 1; i < C; i++)
-                if (j < i) s_A[i * (C + PAD) + j] = tcol[i];
+                if (j < i) s_A[i * (C + PAD) + j] = -acc[i];
         }
         __syncthreads();
     }
@@ -315,47 +357,8 @@ __global__ void pf_gdnc_prep_kernel(const __nv_bfloat16* __restrict__ q,
     // b_m exp(G_m) k[m][d] is formed ONCE per m instead of once per (i,m). Bit-identical order.
     // w_buf/u_buf are sized to n_tokens: the STORE is guarded by i < len so a short final chunk
     // never writes the padded tail past the buffer (main fix #604/#608; scan treats i>=len as 0).
+    // The product itself runs with U0's below, once V is in (gdnc_tri_apply).
     for (int m = tid; m < C; m += nthr) s_t[m] = s_b[m] * __expf(s_g[m]);
-    __syncthreads();
-    {
-        constexpr int NTHR = 256;                 // launcher blockDim (static_asserted there)
-        constexpr int IPT = (C * HD) / NTHR;      // rows per thread
-        constexpr int ISTR = NTHR / HD;           // row stride between per-thread slots
-        const int d = tid % HD, i0 = tid / HD;
-        float acc[IPT];
-        #pragma unroll
-        for (int si = 0; si < IPT; si++) acc[si] = 0.f;
-        // THE TRIANGLE IS WALKED, NOT MASKED. `if (m <= i)` leaves the m > i half of every
-        // (i, m) pair as a predicated-off FFMA that still burns an issue slot -- half of the
-        // C*IPT = 512 per thread at C=32/HD=128. i = i0 + si*ISTR covers exactly [0, C), so
-        // grouping m by ISTR makes the live set a COMPILE-TIME range: for m in [g*ISTR,
-        // (g+1)*ISTR), every si < g is structurally dead and every si > g is structurally live,
-        // leaving one real predicate on the diagonal group si == g. 512 issued multiply-adds
-        // become 272, and the same count of shared loads goes with them.
-        // BIT-IDENTICAL: identical operand set per output, still accumulated in ascending m --
-        // the loop bounds encode the mask instead of a predicate evaluating it.
-        static_assert(IPT * ISTR == C, "the triangle walk needs i = i0 + si*ISTR to cover [0,C)");
-        #pragma unroll
-        for (int g = 0; g < IPT; g++) {
-            #pragma unroll
-            for (int u = 0; u < ISTR; u++) {
-                const int m = g * ISTR + u;
-                const float bk = s_t[m] * gc_to_f(s_k[m * (HD + PAD) + d]);
-                #pragma unroll
-                for (int si = g; si < IPT; si++) {
-                    const int i = i0 + si * ISTR;
-                    if (si > g || u <= i0) acc[si] += s_A[i * (C + PAD) + m] * bk;
-                }
-            }
-        }
-        #pragma unroll
-        for (int si = 0; si < IPT; si++) {
-            const int i = i0 + si * ISTR;
-            if (i < len)
-                w_buf[((size_t)(t0 + i) * v_heads + h) * HD + d] = __float2bfloat16(acc[si]);
-        }
-    }
-    __syncthreads();
 
     // ---- V (in flight since the A/M tile) in the Q tile, then U0 = T . (b_m v_m) ----
     __pipeline_wait_prior(0);
@@ -409,32 +412,24 @@ __global__ void pf_gdnc_prep_kernel(const __nv_bfloat16* __restrict__ q,
         }
     __syncthreads();
     {
-        // Same m-outermost form as W^ above (bit-identical), store guarded by i < len (#604/#608).
-        constexpr int NTHR = 256;
-        constexpr int IPT = (C * HD) / NTHR;
-        constexpr int ISTR = NTHR / HD;
+        // W^ and U0 = T . (b_m v_m) together: one pass over T for both (gdnc_tri_apply), each
+        // stored guarded by i < len (#604/#608).
+        constexpr int NTHR = 256;                 // launcher blockDim (static_asserted there)
+        constexpr int IPT = (C * HD) / NTHR;      // rows per thread
+        constexpr int ISTR = NTHR / HD;           // row stride between per-thread slots
         const int d = tid % HD, i0 = tid / HD;
-        float acc[IPT];
+        float accw[IPT], accu[IPT];
         #pragma unroll
-        for (int si = 0; si < IPT; si++) acc[si] = 0.f;
-        #pragma unroll
-        for (int g = 0; g < IPT; g++) {          // same triangle walk as W^ above
-            #pragma unroll
-            for (int u = 0; u < ISTR; u++) {
-                const int m = g * ISTR + u;
-                const float bv = s_b[m] * gc_to_f(s_x[m * (HD + PAD) + d]);
-                #pragma unroll
-                for (int si = g; si < IPT; si++) {
-                    const int i = i0 + si * ISTR;
-                    if (si > g || u <= i0) acc[si] += s_A[i * (C + PAD) + m] * bv;
-                }
-            }
-        }
+        for (int si = 0; si < IPT; si++) { accw[si] = 0.f; accu[si] = 0.f; }
+        gdnc_tri_apply<C, HD, IPT, ISTR, PAD>(s_A, s_t, s_k, s_b, s_x, d, i0, accw, accu);
         #pragma unroll
         for (int si = 0; si < IPT; si++) {
             const int i = i0 + si * ISTR;
-            if (i < len)
-                u_buf[((size_t)(t0 + i) * v_heads + h) * HD + d] = __float2bfloat16(acc[si]);
+            if (i < len) {
+                const size_t o = ((size_t)(t0 + i) * v_heads + h) * HD + d;
+                w_buf[o] = __float2bfloat16(accw[si]);
+                u_buf[o] = __float2bfloat16(accu[si]);
+            }
         }
     }
 }
