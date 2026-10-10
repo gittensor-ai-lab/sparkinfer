@@ -5,6 +5,20 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+## [0.6.34] — 2026-10-10
+
+**The release binaries build again: 0.6.33's Windows build failed to link, so it shipped without
+tarballs. Everything else is as in 0.6.33.**
+
+### Fixed
+
+- **The NVFP4-off build links again** (#1375). With `-DSPARKINFER_NVFP4=OFF` (the Windows build:
+  CUTLASS's SM100 headers do not compile under MSVC), `prefill_nvfp4.cu` supplies a returns-`false`
+  fallback for every NVFP4 entry point; `launch_prefill_nvfp4_gemm_fill` (#1357),
+  `launch_prefill_nvfp4_gemm_swiglu_quant` and `prefill_nvfp4_swiglu_epilogue_on` (#1344) and
+  `launch_prefill_nvfp4_gate_up_swiglu_bf16` (#1353) had none, so `qwen3_gguf_bench` failed with
+  four unresolved externals. Callers take their existing non-NVFP4 path when these return `false`.
+
 ## [0.6.33] — 2026-10-10
 
 **Swift-Qwen3.8-27B runs out of the box and leads vLLM in every serving cell; 20 contributor
