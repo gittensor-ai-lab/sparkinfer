@@ -5,6 +5,15 @@ versions track the GitHub [releases](https://github.com/gittensor-ai-lab/sparkin
 
 ## [Unreleased]
 
+### Added
+
+- **Swift-Qwen3.8-27B-NVFP4-RTX5090 is supported and benchmarked** (README, "Fine-tunes"). It
+  serves at base Qwen3.8's speed and leads vLLM 0.30.0 in every cell: chat 327 / 971 / 1,320 vs
+  271 / 862 / 1,239 tok/s at 4 / 16 / 32 requests, and time to first token on a 120K-token prompt
+  14.6 vs 22.3 s.
+- **`cells.sh` takes `VL_EXTRA`**: extra `vllm serve` arguments, e.g. `--kv-cache-dtype fp8` for a
+  checkpoint whose KV scheme vLLM cannot read.
+
 ### Fixed
 
 - **Qwen3.8's reasoning effort follows its chat template.** Both Qwen3.8 templates give xhigh (the
