@@ -57,6 +57,9 @@ ptq1_rotq_fp4_kernel(const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* _
                      const signed char* __restrict__ sign, unsigned char* __restrict__ q,
                      int rows, int k) {
     __shared__ float sh[kSpan];
+    // The GEMM that reads q is launched programmatic (launch_ptq1_fp4_gemm): let it become
+    // resident now. Its griddepcontrol.wait still covers this whole grid.
+    asm volatile("griddepcontrol.launch_dependents;");
     const int t = threadIdx.x, lane = t & 31;
     const int row = blockIdx.x;
     unsigned char* qrow = q + (size_t)row * (k / 2);
@@ -387,6 +390,11 @@ ptq1_fp4_gemm_kernel(const unsigned char* __restrict__ a, int M, int K, Legs L,
         asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     }
     __syncthreads();
+    // Launched programmatic: the table and the barriers above are this kernel's own, so they are
+    // built while the kernel before it (the activation's rotation) still runs; A and C are its
+    // output and read-modify-write target, and nothing touches them before this. A no-op for an
+    // ordinary launch.
+    asm volatile("griddepcontrol.wait;" ::: "memory");
     const int nblk = K / kBlk;
     auto item = [&](int w, int& mt, int& leg, int& n0, int& kb0, int& nst) {
         mt = w % mtiles;
@@ -671,9 +679,29 @@ bool launch_ptq1_fp4_gemm(const void* a, int m, int k, const void* const* w, voi
     const auto* A = static_cast<const unsigned char*>(a);
     float* P = splits > 1 ? part : nullptr;
     const bool rk = resid && !P;
+    // Programmatic: the CTAs -- one an SM, holding its whole register file and ~57 KB of shared
+    // memory -- are placed, and build their table, while the rotation before them drains, instead
+    // of after it (prefill@128 9351 -> 9709 tok/s on Ternary-Bonsai-2). SPARKINFER_PTQ1_FP4_PDL=0
+    // launches it the ordinary way.
+    static const bool pdl = [] {
+        const char* e = getenv("SPARKINFER_PTQ1_FP4_PDL");
+        return !(e && e[0] == '0');
+    }();
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = dim3(grid);
+    cfg.stream = st;
+    cudaLaunchAttribute la{};
+    la.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    la.val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = &la;
+    cfg.numAttrs = pdl ? 1 : 0;
 #define PTQ1_FP4_GO(R_, F_)                                                                   \
-    ptq1_fp4_gemm_kernel<R_, F_><<<grid, Ring<F_>::THREADS, F_ ? smem_f : smem_s, st>>>(      \
-        A, m, k, L, P, per, mtiles, tiles_n, nitems, alpha)
+    do {                                                                                      \
+        cfg.blockDim = dim3(Ring<F_>::THREADS);                                               \
+        cfg.dynamicSmemBytes = F_ ? smem_f : smem_s;                                          \
+        cudaLaunchKernelEx(&cfg, ptq1_fp4_gemm_kernel<R_, F_>, A, m, k, L, P, per, mtiles,    \
+                           tiles_n, nitems, alpha);                                           \
+    } while (0)
     if (fold) { if (rk) PTQ1_FP4_GO(true, true);  else PTQ1_FP4_GO(false, true);  }
     else      { if (rk) PTQ1_FP4_GO(true, false); else PTQ1_FP4_GO(false, false); }
 #undef PTQ1_FP4_GO
