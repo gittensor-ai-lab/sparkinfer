@@ -227,6 +227,14 @@ struct Legs {
     int nleg;
 };
 
+// Leg `leg`'s entry of one of Legs' arrays. A runtime index into a kernel parameter's array makes
+// every thread copy the whole Legs (104 bytes) out of the parameter bank into local memory at
+// kernel start; the select reads the entry straight from the parameter bank.
+template <typename T>
+__device__ __forceinline__ T leg_of(const T (&a)[MAX_LEGS], int leg) {
+    static_assert(MAX_LEGS == 3, "one select per leg");
+    return leg == 0 ? a[0] : leg == 1 ? a[1] : a[2];
+}
 __device__ __forceinline__ int swz(int r, int ch) { return r * BKB + ((ch ^ ((r >> 1) & 3)) << 4); }
 __device__ __forceinline__ unsigned smem_u32(const void* p) {
     return (unsigned)__cvta_generic_to_shared(p);
@@ -334,7 +342,7 @@ template <bool RESID>
 __device__ __forceinline__ void store_tile(const float (&acc)[4][4][4], const Legs& L, int leg,
                                            float* __restrict__ part, int z, int M, int m0, int n0,
                                            int wm, int wn, int lane, float alpha) {
-    const int N = L.n[leg];
+    const int N = leg_of(L.n, leg);
 #pragma unroll
     for (int f = 0; f < 4; f++)
 #pragma unroll
@@ -346,11 +354,11 @@ __device__ __forceinline__ void store_tile(const float (&acc)[4][4][4], const Le
                 const int col = n0 + wn * 32 + g * 8 + (lane & 3) * 2;
                 const float v0 = acc[f][g][2 * hh], v1 = acc[f][g][2 * hh + 1];
                 if (part) {
-                    float* P = part + L.poff[leg] + ((size_t)z * M + row) * N + col;
+                    float* P = part + leg_of(L.poff, leg) + ((size_t)z * M + row) * N + col;
                     *reinterpret_cast<float2*>(P) = make_float2(v0, v1);
                 } else {
                     __nv_bfloat162* C =
-                        reinterpret_cast<__nv_bfloat162*>(L.c[leg] + (size_t)row * N + col);
+                        reinterpret_cast<__nv_bfloat162*>(leg_of(L.c, leg) + (size_t)row * N + col);
                     float2 o = make_float2(v0 * alpha, v1 * alpha);
                     if (RESID) {
                         const float2 p = __bfloat1622float2(*C);
@@ -395,7 +403,7 @@ ptq1_fp4_gemm_kernel(const unsigned char* __restrict__ a, int M, int K, Legs L,
 #pragma unroll
         for (int i = 1; i < MAX_LEGS; i++)
             if (i < L.nleg && nt >= L.first[i]) leg = i;
-        n0 = (nt - L.first[leg]) * BN;
+        n0 = (nt - leg_of(L.first, leg)) * BN;
         kb0 = z * nblk_split;
         nst = min(nblk, kb0 + nblk_split) - kb0;
     };
@@ -463,7 +471,7 @@ ptq1_fp4_gemm_kernel(const unsigned char* __restrict__ a, int M, int K, Legs L,
             item(w, mt, leg, n0, kb0, nst);
             const int m0 = mt * BM;
             const unsigned* wrow = reinterpret_cast<const unsigned*>(
-                L.w[leg] + (size_t)(n0 + br) * nblk * kBlkBytes + (size_t)kb0 * kBlkBytes);
+                leg_of(L.w, leg) + (size_t)(n0 + br) * nblk * kBlkBytes + (size_t)kb0 * kBlkBytes);
             // Two stages an iteration (independent decode chains), their words (2h, 2h+1, 4+h and 6
             // of the block) a pair ahead.
             unsigned tw[2][4], nx[2][4];
