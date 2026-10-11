@@ -204,6 +204,16 @@ bool launch_ptq1_gate_rotq_rows_nvfp4(const void* x_bf16, const void* gate_bf16,
                                       const signed char* sign, void* q, int rows, int k,
                                       int block, cudaStream_t stream, void* sf_cutlass,
                                       int gate_hs = 0);
+// launch_ptq1_rotq_fp4 (prefill_ptq1_fp4.h, the short prompt's operand) with its input's
+// producer folded in, as the two above: norm rmsnorm_kernel(x, weight), out_norm still receiving
+// the bf16 row when set; gnorm pf_gated_norm_kernel(x, z, weight) per 128-wide head. Same bytes as
+// the producer and then launch_ptq1_rotq_fp4. False, launching nothing, where they do not apply.
+bool launch_ptq1_norm_rotq_fp4(const void* x_bf16, const void* weight_bf16, float eps,
+                               void* out_norm, const signed char* sign, void* a, int rows, int k,
+                               int block, cudaStream_t stream);
+bool launch_ptq1_gnorm_rotq_fp4(const void* x_bf16, const void* z_bf16, const void* weight_bf16,
+                                float eps, int head_dim, const signed char* sign, void* a, int rows,
+                                int k, int block, cudaStream_t stream);
 bool launch_ptq1_rotq_rows_i8(const void* x_bf16, const signed char* sign, signed char* q,
                               float* scale, signed char* qp, int rows, int k, int block,
                               cudaStream_t stream);
