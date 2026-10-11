@@ -62,6 +62,20 @@ bool launch_prefill_nvfp4_gemm_pdl(const void*, const void*, const void*, const 
                                    int, int, void*, cudaStream_t, float, const void*) {
     return false;
 }
+bool launch_prefill_nvfp4_gemm_fill(const void*, const void*, const void*, const void*, void*, int,
+                                    int, int, void*, cudaStream_t, float, const void*) {
+    return false;
+}
+bool prefill_nvfp4_swiglu_epilogue_on() { return false; }
+bool launch_prefill_nvfp4_gemm_swiglu_quant(const void*, const void*, const void*, const void*,
+                                            const void*, void*, void*, int, int, int, cudaStream_t,
+                                            float) {
+    return false;
+}
+bool launch_prefill_nvfp4_gate_up_swiglu_bf16(const void*, const void*, const void*, const void*,
+                                              void*, int, int, int, float, float, cudaStream_t) {
+    return false;
+}
 size_t prefill_nvfp4_workspace_bytes_f32(int, int, int) { return 0; }
 bool launch_prefill_nvfp4_gemm_f32(const void*, const void*, const void*, const void*, void*, int,
                                    int, int, void*, cudaStream_t, float) { return false; }
