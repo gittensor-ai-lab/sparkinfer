@@ -16,6 +16,7 @@
 // The weights are read exactly as the checkpoint stores them; the arithmetic's own rounding is
 // the activation's int8 step (and, in prefill, the per-row weight scale).
 #include "sparkinfer/kernels/ternary.h"
+#include "sparkinfer/kernels/prefill_ptq1_fp4.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -25,6 +26,7 @@
 
 #include <cstdlib>
 #include <mutex>
+#include <type_traits>
 
 namespace sparkinfer { namespace kernels {
 
@@ -83,6 +85,14 @@ __device__ __forceinline__ unsigned e2m1_rn(float v) {
                      : a <= 2.5f  ? 4u : a < 3.5f  ? 5u : a <= 5.f   ? 6u : 7u;
     return c | ((__float_as_uint(v) >> 28) & 8u);
 }
+// An e2m1 code's value.
+__device__ __forceinline__ float e2m1_val(unsigned c) {
+    const unsigned m = c & 7u;
+    // From code 2 on, exponent m >> 1 (bias 1) and one mantissa bit, as an fp32's bits.
+    const float a = m < 2u ? 0.5f * (float)m
+                           : __uint_as_float((((m >> 1) + 126u) << 23) | ((m & 1u) << 22));
+    return (c & 8u) ? -a : a;
+}
 // The pair packed as the intrinsic packs it: x in the low nibble, y in the high one.
 __device__ __forceinline__ unsigned e2m1x2_rn(float x, float y) {
     return e2m1_rn(x) | (e2m1_rn(y) << 4);
@@ -126,7 +136,9 @@ ptq1_rotq_kernel(const __nv_bfloat16* x, const __nv_bfloat16* u,   // the launch
                  float* __restrict__ qd, int* __restrict__ qs, int k,
                  __nv_bfloat16* __restrict__ out_sum = nullptr,
                  __nv_bfloat16* __restrict__ out_norm = nullptr,
-                 i8_blk_q8_1* __restrict__ out_q8 = nullptr) {
+                 i8_blk_q8_1* __restrict__ out_q8 = nullptr,
+                 unsigned char* __restrict__ f4 = nullptr, unsigned char* __restrict__ f4s = nullptr,
+                 float* __restrict__ f4m = nullptr) {
     __shared__ float sh[kSpan];
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
     const long row = blockIdx.y;
@@ -281,6 +293,47 @@ ptq1_rotq_kernel(const __nv_bfloat16* x, const __nv_bfloat16* u,   // the launch
     constexpr float kNorm = 0.03125f;   // 1/sqrt(1024)
 #pragma unroll
     for (int i = 0; i < 4; ++i) v[i] = sh[t * 4 + i] * kNorm;
+    if (f4) {
+        // The NVFP4 copy the packed FP4 rows GEMM reads (packed_ptq1_fp4_sm120.cu), in its order:
+        // this lane's four values are k-step s = lane >> 3, half lane >> 2 & 1, slot lane & 3 of
+        // its 128-block, and lane L and L ^ 4 (the two halves) make one word of eight codes. A
+        // scale per 16 values, over lanes {L, L ^ 1, L ^ 4, L ^ 5}: ue4m3(amax / 6), the prefill
+        // NVFP4 rule. And the block's sum of the values those codes stand for, [block][32 rows]:
+        // the FP4 kernel reads the trit digits 0..2 as they are and takes it back out.
+        float ga = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
+        ga = fmaxf(ga, __shfl_xor_sync(0xffffffffu, ga, 1));
+        ga = fmaxf(ga, __shfl_xor_sync(0xffffffffu, ga, 4));
+        // Of ue4m3(amax / 6) and ue4m3(amax / 4), the scale the group's 16 values round to with
+        // the smaller squared error ("four over six").
+        __nv_fp8_storage_t qb = 0;
+        float qsf = 0.f, best = 0.f;
+        unsigned c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+#pragma unroll
+        for (int cand = 0; cand < 2; ++cand) {
+            const __nv_fp8_storage_t b = __nv_cvt_float_to_fp8(
+                fmaxf(ga * (cand ? 0.25f : 1.f / 6.f), 0x1p-9f), __NV_SATFINITE, __NV_E4M3);
+            const float sf = __half2float(__half(__nv_cvt_fp8_to_halfraw(b, __NV_E4M3)));
+            const float rs = __frcp_rn(sf);
+            const unsigned d0 = e2m1_rn(v[0] * rs), d1 = e2m1_rn(v[1] * rs);
+            const unsigned d2 = e2m1_rn(v[2] * rs), d3 = e2m1_rn(v[3] * rs);
+            const float r0 = v[0] - sf * e2m1_val(d0), r1 = v[1] - sf * e2m1_val(d1);
+            const float r2 = v[2] - sf * e2m1_val(d2), r3 = v[3] - sf * e2m1_val(d3);
+            float e = r0 * r0 + r1 * r1 + r2 * r2 + r3 * r3;
+            e += __shfl_xor_sync(0xffffffffu, e, 1);
+            e += __shfl_xor_sync(0xffffffffu, e, 4);
+            if (cand == 0 || e < best) { best = e; qb = b; qsf = sf; c0 = d0; c1 = d1; c2 = d2; c3 = d3; }
+        }
+        const unsigned w = c0 | (c1 << 8) | (c2 << 16) | (c3 << 24);
+        float fs = qsf * ((e2m1_val(c0) + e2m1_val(c1)) + (e2m1_val(c2) + e2m1_val(c3)));
+#pragma unroll
+        for (int o = 16; o; o >>= 1) fs += __shfl_xor_sync(0xffffffffu, fs, o);
+        const unsigned o = __shfl_xor_sync(0xffffffffu, w, 4);
+        const int s4 = lane >> 3, hf = (lane >> 2) & 1, tq = lane & 3;
+        const size_t fb = (size_t)row * (k / kBlk) + blockIdx.x * (kSpan / kBlk) + warp;
+        if (!hf) *reinterpret_cast<unsigned*>(f4 + fb * 64 + s4 * 16 + tq * 4) = w | (o << 4);
+        if (!hf && !(tq & 1)) f4s[fb * 8 + 2 * s4 + (tq >> 1)] = qb;
+        if (lane == 0) f4m[(blockIdx.x * (kSpan / kBlk) + warp) * 32 + row] = fs;
+    }
     float am = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
 #pragma unroll
     for (int o = 16; o; o >>= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, o));
@@ -966,11 +1019,92 @@ bool row1_tiles_on() {
     return v;
 }
 
+// The NVFP4 shadow of a packed step's int8 activation (see ptq1_rotq_kernel's f4 output and
+// launch_ptq1_fp4_rows_bf16). A rotation of 17..32 rows writes it into one of two fixed device
+// buffers, keyed by the int8 buffer it shadows; any other write to that int8 buffer drops the
+// key, so the rows GEMM takes the FP4 kernel only when the copy is the current one. Graph capture
+// sees the same decisions it replays: they depend on pointers and shapes alone.
+// SPARKINFER_PTQ1_FP4_ROWS=0 keeps every packed row on the int8 kernel (A/B in one binary).
+constexpr int kF4MaxRows = 32, kF4MaxK = 17408, kF4Slots = 2;
+__device__ unsigned char g_f4_x[kF4Slots][(size_t)kF4MaxRows * kF4MaxK / 2];
+__device__ unsigned char g_f4_s[kF4Slots][(size_t)kF4MaxRows * kF4MaxK / 16];
+__device__ float g_f4_m[kF4Slots][(size_t)kF4MaxRows * kF4MaxK / kBlk];
+struct F4Shadow { const void* q = nullptr; int rows = 0, k = 0; };
+F4Shadow g_f4[kF4Slots];
+int g_f4_next = 0;
+std::mutex g_f4_mu;
+bool fp4_rows_on() {
+    static const bool v = [] {
+        const char* e = getenv("SPARKINFER_PTQ1_FP4_ROWS");
+        return !(e && e[0] == '0');
+    }();
+    return v;
+}
+bool f4_ptrs(int slot, unsigned char** x, unsigned char** s, float** m) {
+    static unsigned char* bx = nullptr;
+    static unsigned char* bs = nullptr;
+    static float* bm = nullptr;
+    static bool bad = false;
+    if (!bx && !bad) {
+        if (cudaGetSymbolAddress(reinterpret_cast<void**>(&bx), g_f4_x) != cudaSuccess ||
+            cudaGetSymbolAddress(reinterpret_cast<void**>(&bs), g_f4_s) != cudaSuccess ||
+            cudaGetSymbolAddress(reinterpret_cast<void**>(&bm), g_f4_m) != cudaSuccess) {
+            cudaGetLastError();
+            bx = bs = nullptr;
+            bm = nullptr;
+            bad = true;
+        }
+    }
+    if (!bx) return false;
+    *x = bx + (size_t)slot * kF4MaxRows * kF4MaxK / 2;
+    *s = bs + (size_t)slot * kF4MaxRows * kF4MaxK / 16;
+    *m = bm + (size_t)slot * kF4MaxRows * kF4MaxK / kBlk;
+    return true;
+}
+void f4_drop(const void* q) {
+    std::lock_guard<std::mutex> lk(g_f4_mu);
+    for (auto& e : g_f4) if (e.q == q) e = F4Shadow{};
+}
+// The slot rotq_launch writes for (q, rows, k), or -1 (and the key dropped) when it writes none.
+int f4_claim(const void* q, int rows, int k) {
+    // From 17 rows: at 16 and under it is level with the int8 kernel, which is the closer one.
+    const bool want = fp4_rows_on() && rows > 16 && rows <= kF4MaxRows && k <= kF4MaxK &&
+                      ptq1_fp4_gemm_supported(rows, k);
+    std::lock_guard<std::mutex> lk(g_f4_mu);
+    int slot = -1;
+    for (int i = 0; i < kF4Slots; ++i) if (g_f4[i].q == q) slot = i;
+    if (!want) {
+        if (slot >= 0) g_f4[slot] = F4Shadow{};
+        return -1;
+    }
+    if (slot < 0) { slot = g_f4_next; g_f4_next = (g_f4_next + 1) % kF4Slots; }
+    g_f4[slot] = F4Shadow{q, rows, k};
+    return slot;
+}
+int f4_find(const void* q, int rows, int k) {
+    std::lock_guard<std::mutex> lk(g_f4_mu);
+    for (int i = 0; i < kF4Slots; ++i)
+        if (g_f4[i].q == q && g_f4[i].rows == rows && g_f4[i].k == k) return i;
+    return -1;
+}
+
 template <typename OutT>
 bool launch_rows_i8(const signed char* xq, const float* xd, const int* xs, const void* w0,
                     const void* w1, OutT* y0, OutT* y1, int m, int n_rows, int k,
                     cudaStream_t st, float* part = nullptr, size_t part_cap = 0) {
     if (m <= 0 || n_rows <= 0 || k <= 0 || k % (kBlk * kStepBlocks) != 0) return false;
+    // 17..32 rows whose activation has its current NVFP4 copy: the FP4 tensor-core kernel.
+    if constexpr (std::is_same<OutT, __nv_bfloat16>::value) {
+        if (m > 16 && m <= kF4MaxRows) {
+            const int slot = f4_find(xq, m, k);
+            unsigned char *fx = nullptr, *fs = nullptr;
+            float* fm = nullptr;
+            if (slot >= 0 && f4_ptrs(slot, &fx, &fs, &fm) &&
+                launch_ptq1_fp4_rows_bf16(fx, fs, fm, w0, w1, y0, y1, m, n_rows, k, st, part,
+                                          part_cap))
+                return true;
+        }
+    }
     const int nblk = k / kBlk;
     // The tensor-core kernel tiles 128 weight rows; its k split must be the GEMV's (row_splits),
     // so a launch that cannot hold the partials declines rather than summing differently. One
@@ -1470,8 +1604,14 @@ void rotq_launch(int rows, int k, cudaStream_t st, const __nv_bfloat16* x, const
         const char* e = getenv("SPARKINFER_ROTQ_PDL");
         return !(e && e[0] == '0');
     }();
+    unsigned char* f4 = nullptr;
+    unsigned char* f4s = nullptr;
+    float* f4m = nullptr;
+    const int slot = f4_claim(q, rows, k);
+    if (slot >= 0 && !f4_ptrs(slot, &f4, &f4s, &f4m)) f4_drop(q);
     launch_rows_pdl(pdl, ptq1_rotq_kernel<MODE>, dim3((unsigned)(k / kSpan), (unsigned)rows),
-                    dim3(256), 0, st, x, u, nw, eps, sign, q, qd, qs, k, out_sum, out_norm, out_q8);
+                    dim3(256), 0, st, x, u, nw, eps, sign, q, qd, qs, k, out_sum, out_norm, out_q8,
+                    f4, f4s, f4m);
 }
 
 bool launch_ptq1_rotq_bf16(const void* x_bf16, const signed char* sign, signed char* q,
@@ -1617,6 +1757,7 @@ bool launch_ptq1_rows_i8(const void* w_ptq1, signed char* q, float* scale, int r
 bool launch_ptq1_swiglu_rotq_rows_i8(const void* gate_bf16, const void* up_bf16,
                                      const signed char* sign, signed char* q, float* scale,
                                      signed char* qp, int rows, int k, int block, cudaStream_t st) {
+    f4_drop(q);   // an int8 write the FP4 shadow does not follow
     if (rows <= 0 || block != kSpan || k % kSpan != 0 || k > 17 * kSpan) return false;
     const auto* g = static_cast<const __nv_bfloat16*>(gate_bf16);
     const auto* u = static_cast<const __nv_bfloat16*>(up_bf16);
@@ -1707,6 +1848,7 @@ bool launch_ptq1_gate_rotq_rows_nvfp4(const void* x_bf16, const void* gate_bf16,
 bool launch_ptq1_rotq_rows_i8(const void* x_bf16, const signed char* sign, signed char* q,
                               float* scale, signed char* qp, int rows, int k, int block,
                               cudaStream_t st) {
+    f4_drop(q);   // an int8 write the FP4 shadow does not follow
     if (rows <= 0 || block != kSpan || k % kSpan != 0 || k > 8 * kSpan) return false;
     const auto* x = static_cast<const __nv_bfloat16*>(x_bf16);
     if (k <= 5 * kSpan)

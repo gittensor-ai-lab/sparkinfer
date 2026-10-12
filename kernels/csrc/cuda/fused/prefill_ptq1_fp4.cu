@@ -10,5 +10,9 @@ bool launch_ptq1_rotq_fp4(const void*, const void*, const signed char*, void*, i
                           cudaStream_t) { return false; }
 bool launch_ptq1_fp4_gemm(const void*, int, int, const void* const*, void* const*, const int*, int,
                           bool, float*, size_t, cudaStream_t) { return false; }
+bool launch_ptq1_fp4_rows_bf16(const void*, const void*, const float*, const void*, const void*,
+                               void*, void*, int, int, int, cudaStream_t, float*, size_t) {
+    return false;
+}
 }}  // namespace sparkinfer::kernels
 #endif

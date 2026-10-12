@@ -23,5 +23,13 @@ bool launch_ptq1_rotq_fp4(const void* x_bf16, const void* up_bf16, const signed 
 bool launch_ptq1_fp4_gemm(const void* a, int m, int k, const void* const* w, void* const* c,
                           const int* n, int nleg, bool resid, float* part, size_t part_cap,
                           cudaStream_t stream);
+// The packed decode's rows GEMM (launch_gemm_ptq1_i8_rows_bf16's shapes, 17..32 rows) on the FP4
+// tensor cores: xf / xsf are the activation's NVFP4 copy that ptq1_rotq_kernel writes beside its
+// int8 one (64 bytes and 8 ue4m3 scales per 128-value block, in the int8 kernel's k order), xsum
+// each block's sum of those NVFP4 values, [block][32 tokens]. The tiles and the k split are that
+// kernel's. False, launching nothing, where the shape does not fit.
+bool launch_ptq1_fp4_rows_bf16(const void* xf, const void* xsf, const float* xsum, const void* w0,
+                               const void* w1, void* y0, void* y1, int m, int n_rows, int k,
+                               cudaStream_t stream, float* part, size_t part_cap);
 
 }}  // namespace sparkinfer::kernels
