@@ -2945,6 +2945,32 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
         pf_cu(cudaEventCreateWithFlags(&moe_ev_sg, cudaEventDisableTiming), "moe ev_sg");
 
     bool attn_norm_deferred = false;
+    // Muse Glimmer: while a layer's QK-norm and attention run, which read a few MB of KV and leave
+    // DRAM idle, a side stream pulls the head of that layer's interleaved gate/up operand -- the
+    // rows the GEMM's first CTAs read, and their scale factors -- into L2, as the packed decode
+    // step does. Same bytes; only where the GEMM is served from changes. Forked per layer, joined
+    // once after the layers so no programmatic launch on the main stream loses its edge.
+    // prefill@128 pp against none: 16 MB +1.8%, 32 MB +3.7%, 48 MB +3.2%. At 512 rows the GEMMs are
+    // compute-bound and the prefetch only competes with them (-0.6% to -1.1% at 16-48 MB), so
+    // passes over 128 rows go without. SPARKINFER_MUSE_PF_L2PF_MB sets the size (0 = off),
+    // SPARKINFER_MUSE_PF_L2PF_MAXN the row limit.
+    static const int muse_pf_mb = [] {
+        const char* e = getenv("SPARKINFER_MUSE_PF_L2PF_MB");
+        return e ? std::max(0, atoi(e)) : 32;
+    }();
+    static const int muse_pf_maxn = [] {
+        const char* e = getenv("SPARKINFER_MUSE_PF_L2PF_MAXN");
+        return e ? atoi(e) : 128;
+    }();
+    static cudaStream_t muse_pf_st = nullptr;
+    static cudaEvent_t muse_pf_fork = nullptr, muse_pf_join = nullptr;
+    const bool muse_pf = c.muse_glimmer && muse_pf_mb > 0 && N <= muse_pf_maxn;
+    if (muse_pf && !muse_pf_st) {
+        pf_cu(cudaStreamCreateWithFlags(&muse_pf_st, cudaStreamNonBlocking), "muse pf l2pf stream");
+        pf_cu(cudaEventCreateWithFlags(&muse_pf_fork, cudaEventDisableTiming), "muse pf l2pf fork");
+        pf_cu(cudaEventCreateWithFlags(&muse_pf_join, cudaEventDisableTiming), "muse pf l2pf join");
+    }
+    bool muse_pf_out = false;
     for (int L = 0; L < c.n_layers; L++) {
         const Qwen35LayerWeights& w = s.w.layers[L];
         // A sliding-window layer reads and writes its own (possibly capped, ring-mapped) slice;
@@ -3654,6 +3680,15 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
                 // calls that prompt would have made on its own. Everything else in the layer is
                 // row-parallel and runs once over the whole pack.
                 const int segs = multi ? nseg : 1;
+                if (muse_pf && muse_pf_st && w.gu_interleaved && w.gate_fp4 && w.gate_fp4_sf) {
+                    const size_t data = (size_t)c.moe_ffn * H;   // 2*ffn rows of H/2 bytes
+                    const size_t want = std::min(data, (size_t)muse_pf_mb << 20);
+                    pf_cu(cudaEventRecord(muse_pf_fork, st), "muse pf l2pf fork");
+                    pf_cu(cudaStreamWaitEvent(muse_pf_st, muse_pf_fork, 0), "muse pf l2pf fork wait");
+                    kernels::launch_l2_prefetch_bulk(w.gate_fp4, want, muse_pf_st);
+                    kernels::launch_l2_prefetch_bulk(w.gate_fp4_sf, want / 8, muse_pf_st);
+                    muse_pf_out = true;
+                }
                 for (int si = 0; si < segs; ++si) {
                     const size_t o = multi ? (size_t)s.multi_off[si] : 0;
                     const int len = multi ? s.multi_len[si] : N;
@@ -5417,6 +5452,10 @@ int prefill_batched_run(const Qwen35PrefillCtx& s, const int* prompt_ids, int n,
             norm_xn(next_norm, nw);
         }
         attn_norm_deferred = defer_next_attn_norm;
+    }
+    if (muse_pf_out) {
+        pf_cu(cudaEventRecord(muse_pf_join, muse_pf_st), "muse pf l2pf done");
+        pf_cu(cudaStreamWaitEvent(st, muse_pf_join, 0), "muse pf l2pf join");
     }
 
     if (moe_overlap) {
