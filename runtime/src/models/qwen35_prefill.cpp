@@ -6463,11 +6463,45 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
     // weights into L2 while that layer's attention runs (see muse_l2pf_mb below).
     static thread_local cudaStream_t muse_pf_st = nullptr;
     static thread_local cudaEvent_t muse_pf_fork = nullptr, muse_pf_done = nullptr;
-    if (c.muse_glimmer && packed && !muse_pf_st) {
+    // Ternary-Bonsai-2's packed step forks the same prefetch for its ternary gate/up (bonsai_l2pf).
+    if ((c.muse_glimmer || s.bonsai_dec_layers) && packed && !muse_pf_st) {
         pf_cu(cudaStreamCreateWithFlags(&muse_pf_st, cudaStreamNonBlocking), "muse l2pf stream");
         pf_cu(cudaEventCreateWithFlags(&muse_pf_fork, cudaEventDisableTiming), "muse l2pf fork");
         pf_cu(cudaEventCreateWithFlags(&muse_pf_done, cudaEventDisableTiming), "muse l2pf done");
     }
+    // Ternary-Bonsai-2's packed step: its conv and GDN scan (or its attention) read a few MB and
+    // leave DRAM idle, and then the FFN's gate/up streams 39 MB at the bus rate. Pull the head of
+    // the two matrices that layer's FFN arm reads -- the decode shadow's at up to
+    // SPARKINFER_BONSAI_CB_SHADOW_MAX_ROWS rows, the checkpoint's above -- into L2 from the side
+    // stream while those run. Same bytes; only where they are served from changes.
+    // Per matrix, cb-decode tok/s against none (with the DX decode): 2 rows +2.0% at 4 MB, 4 rows
+    // +1.2% (8 MB +1.5%), 8 rows +0.8% (16 MB -3.3%), 16 rows +0.8%; 32 rows lose at any size
+    // (-0.8% at 4 MB), so wider steps go without. SPARKINFER_BONSAI_PACKED_L2PF_MB sets one size
+    // for every width (0 = off).
+    auto bonsai_l2pf = [&](int L, bool& pf_out) {
+        static const int mb_env = [] {
+            const char* e = getenv("SPARKINFER_BONSAI_PACKED_L2PF_MB");
+            return e ? std::max(0, atoi(e)) : -1;
+        }();
+        const int mb = mb_env >= 0 ? mb_env : N <= 16 ? 4 : 0;
+        static const int shadow_rows = [] {
+            const char* e = getenv("SPARKINFER_BONSAI_CB_SHADOW_MAX_ROWS");
+            return e ? atoi(e) : 8;
+        }();
+        if (!mb || !packed || !s.bonsai_dec_layers || !muse_pf_st) return;
+        const Qwen35LayerWeights& lw =
+            N <= shadow_rows ? s.bonsai_dec_layers[L] : s.w.layers[L];
+        if (lw.gate_qtype != kPtq1GgmlType || lw.up_qtype != kPtq1GgmlType || !lw.gate_q ||
+            !lw.up_q)
+            return;
+        const size_t bytes = (size_t)ffn * (H / 128) * 28;   // PTQ1_0: 28 bytes a 128-block
+        const size_t want = std::min(bytes, (size_t)mb << 20);
+        pf_cu(cudaEventRecord(muse_pf_fork, st), "bonsai l2pf fork");
+        pf_cu(cudaStreamWaitEvent(muse_pf_st, muse_pf_fork, 0), "bonsai l2pf fork wait");
+        kernels::launch_l2_prefetch_bulk(lw.gate_q, want, muse_pf_st);
+        kernels::launch_l2_prefetch_bulk(lw.up_q, want, muse_pf_st);
+        pf_out = true;
+    };
     if (fork_shared && !ev_fork) {
         pf_cu(cudaEventCreateWithFlags(&ev_fork, cudaEventDisableTiming), "verify fork event");
         pf_cu(cudaEventCreateWithFlags(&ev_join, cudaEventDisableTiming), "verify join event");
@@ -7671,6 +7705,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                 // in place. That in-place update is why packed mode has no commit stage: the
                 // compact pair below deliberately does NOT touch the live state, because a
                 // speculative verify must be able to discard rejected rows.
+                bonsai_l2pf(L, muse_pf_out);
                 kernels::launch_qwen36_conv_split_l2norm_fused_batched(
                     rq, w.ssm_conv, s.packed_lin_conv, conv_off, gq, rk, rv,
                     N, c.linear_q_heads, vh, c.linear_head_dim, c.linear_conv_kernel,
@@ -7900,6 +7935,7 @@ int dflash_verify_short_run(const Qwen35PrefillCtx& s, const int* token_ids, int
                              s.kv->scale_layer_base_elems(L) * 2 : nullptr;
             char* vs = kv8 ? static_cast<char*>(s.kv->v_scale_pool()) +
                              s.kv->scale_layer_base_elems(L) * 2 : nullptr;
+            bonsai_l2pf(L, muse_pf_out);
             if (kv8) {
                 if (per_row)
                     kernels::launch_qknorm_rope_kv_partial_int8_gated(

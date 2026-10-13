@@ -576,6 +576,24 @@ __device__ __forceinline__ void digits5(unsigned w, unsigned (&d)[5]) {
     }
 }
 
+// The same digits without the per-digit masks. A 16-bit lane holding byte q times 3^m stays exact
+// up to m = 5 (242 * 243 < 65536), so its high byte is P_m = floor(q 3^m / 256), and digit m is
+// P_{m+1} - 3 P_m. That difference is linear, so one 32-bit multiply-add forms it for all four
+// bytes at once: every result byte is 0..2, so no byte borrows from the next.
+__device__ __forceinline__ void digits5_dx(unsigned w, unsigned (&d)[5]) {
+    unsigned xl = w & 0x00FF00FFu, xh = __byte_perm(w, 0u, 0x4341);
+    unsigned p[5];
+#pragma unroll
+    for (int m = 0; m < 5; ++m) {
+        xl *= 3u;
+        xh *= 3u;
+        p[m] = __byte_perm(xl, xh, 0x7351);
+    }
+    d[0] = p[0];
+#pragma unroll
+    for (int m = 1; m < 5; ++m) d[m] = p[m] - 3u * p[m - 1];
+}
+
 // wt = word t, w45 = word 4 + (t & 1), w6 = the four-trit carriers + scale.
 //
 // Every lane decodes a carrier pair, so nothing here branches on t: t == 3 starts two trits in,
@@ -583,11 +601,17 @@ __device__ __forceinline__ void digits5(unsigned w, unsigned (&d)[5]) {
 // byte select keeps b[4] for t < 2. Selecting between the lanes' own chains instead compiled to a
 // divergent branch per row and block, and the reconvergence points kept the scheduler from
 // overlapping the decode with the MMAs around it.
+template <bool DX = false>
 __device__ __forceinline__ void row_frags(unsigned wt, unsigned w45, unsigned w6, int t,
                                           unsigned (&f)[4][2]) {
     unsigned a[5], b[5];
-    digits5(wt, a);
-    digits5(w45, b);
+    if (DX) {
+        digits5_dx(wt, a);
+        digits5_dx(w45, b);
+    } else {
+        digits5(wt, a);
+        digits5(w45, b);
+    }
     f[0][0] = a[0]; f[0][1] = a[1]; f[1][0] = a[2]; f[1][1] = a[3]; f[2][0] = a[4];
     const bool hm = t >> 1;
     f[2][1] = hm ? b[1] : b[0];
@@ -616,7 +640,9 @@ __device__ __forceinline__ void row_frags(unsigned wt, unsigned w45, unsigned w6
 // WARPS is 8 (128-row tiles, which the matrix divides) except for the balanced launches in
 // launch_rows_i8, whose last tile may be short: its spare warps still stage and sync, and skip the
 // math and the stores.
-template <int NT, int WARPS, int KB, int ST, typename OutT, bool SPLIT = false>
+//
+// DX decodes the trits with digits5_dx: the same digits in fewer instructions.
+template <int NT, int WARPS, int KB, int ST, typename OutT, bool SPLIT = false, bool DX = false>
 __global__ void __launch_bounds__(WARPS * 32)
 ptq1_mma_rows_kernel(const signed char* __restrict__ xq, const float* __restrict__ xd,
                      const int* __restrict__ xs, const unsigned char* __restrict__ w0,
@@ -746,8 +772,8 @@ ptq1_mma_rows_kernel(const signed char* __restrict__ xq, const float* __restrict
             const unsigned* B = reinterpret_cast<const unsigned*>(wbr + bb * kBlkBytes);
             const unsigned a6 = A[6], b6 = B[6];
             unsigned fa[4][2], fb[4][2];
-            row_frags(A[t], A[o45], a6, t, fa);
-            row_frags(B[t], B[o45], b6, t, fb);
+            row_frags<DX>(A[t], A[o45], a6, t, fa);
+            row_frags<DX>(B[t], B[o45], b6, t, fb);
             const float swA = __half2float(__ushort_as_half((unsigned short)(a6 >> 16)));
             const float swB = __half2float(__ushort_as_half((unsigned short)(b6 >> 16)));
 #pragma unroll
@@ -922,10 +948,19 @@ void launch_mma_rows_t(const signed char* xq, const float* xd, const int* xs, co
     constexpr int KB = 4;
     constexpr size_t shm = (size_t)ST * (WARPS * 16 * KB * kBlkBytes + NT * 8 * (KB * kBlk + 16) +
                                          NT * 8 * KB * 8);
+    // SPARKINFER_PTQ1_ROWS_DX=0 decodes the trits with digits5 (A/B in one binary). Up to 16 tokens,
+    // where the decode is shared by the fewest MMAs (cb-decode +1.2-2.1% at 2-16 rows); at 32 it
+    // measured flat, so those launches keep digits5.
+    static const bool dx_on = [] {
+        const char* e = getenv("SPARKINFER_PTQ1_ROWS_DX");
+        return !(e && e[0] == '0');
+    }();
+    const bool dx = dx_on && NT < 4;
+    auto kern = dx ? ptq1_mma_rows_kernel<NT, WARPS, KB, ST, OutT, SPLIT, true>
+                   : ptq1_mma_rows_kernel<NT, WARPS, KB, ST, OutT, SPLIT, false>;
     static bool attr = false;
     if (!attr) {
-        cudaFuncSetAttribute(ptq1_mma_rows_kernel<NT, WARPS, KB, ST, OutT, SPLIT>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shm);
+        cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shm);
         attr = true;
     }
     const int ctas = (n_rows + 16 * WARPS - 1) / (16 * WARPS), nmat = w1 ? 2 : 1;
@@ -934,7 +969,7 @@ void launch_mma_rows_t(const signed char* xq, const float* xd, const int* xs, co
     // GEMM ends and costs next to nothing, and the last CTA's pass would only lengthen the tail
     // (single-row decode 1% slower).
     unsigned* cnt = SPLIT && WARPS == 8 && NT > 1 ? split_cnt_for(st, ctas * nmat) : nullptr;
-    launch_rows_pdl(NT == 1, ptq1_mma_rows_kernel<NT, WARPS, KB, ST, OutT, SPLIT>,
+    launch_rows_pdl(NT == 1, kern,
                     dim3(ctas * nmat, SPLIT ? S : 1), dim3(WARPS * 32), shm, st, xq, xd, xs,
                     static_cast<const unsigned char*>(w0), static_cast<const unsigned char*>(w1),
                     y0, y1, m, n_rows, nblk, ctas, part, sps, cnt);
