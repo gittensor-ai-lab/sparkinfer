@@ -5,7 +5,7 @@
 # guaranteed stable release to release. Bump deliberately, re-run bridge/tests/ (especially
 # test_bridge_e2e.py's byte-identical round-trip check) before trusting a newer version, not as a
 # routine dependency bump.
-lmcache==0.5.3
+lmcache==0.5.6
 
 # Pulled in transitively by lmcache even for CPU-only KV offload (it represents KV cache data as
 # torch tensors regardless of backend) -- a real, sizeable dependency (~500MB wheel), not optional.
